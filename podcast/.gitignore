@@ -1,0 +1,15 @@
+.env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.DS_Store
+
+sessions/*.json
+audio/input/*
+audio/output/*
+exports/*
+!audio/input/.gitkeep
+!audio/output/.gitkeep
+!exports/.gitkeep
