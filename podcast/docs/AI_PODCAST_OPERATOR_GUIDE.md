@@ -1,6 +1,6 @@
 # AI Podcast Operator Guide
 
-This guide is the practical checklist for getting from the current backend to a real recorded AI podcast session: Florian speaks, Deepgram or xAI transcribes, the LLM responds, ElevenLabs or xAI creates the AI voice, and OBS records the video/audio.
+This guide is the practical checklist for a real recorded AI podcast session. The primary path is OpenAI Realtime native speech-to-speech with interruption support; the chained Deepgram/xAI -> LLM -> ElevenLabs/xAI path remains available as fallback.
 
 Clipping and social distribution are intentionally out of scope here.
 
@@ -19,8 +19,6 @@ source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
 ```
-
-If `pyaudio` fails to install on macOS, the current app can still use `sounddevice`; do not let `pyaudio` block the whole setup unless you later add code that requires it.
 
 ### API Keys
 
@@ -60,21 +58,26 @@ GOOGLE_API_KEY=...
 
 Keep `.env` private. It is gitignored and should never be shared.
 
-### Real Recording Mode
+### Primary Real Recording Mode
 
-For the full AI podcast loop, set:
+For the lowest-hesitation live podcast loop, set:
 
 ```env
+CONVERSATION_MODE=realtime
+OPENAI_API_KEY=...
 INPUT_MODE=mic
-STT_MODE=deepgram
-TTS_MODE=elevenlabs
-CONFIRM_TRANSCRIPT=true
-PLAYBACK_MODE=file-only
+REALTIME_MODEL=gpt-realtime
+REALTIME_VOICE=marin
+REALTIME_TRANSCRIPTION_MODEL=gpt-4o-transcribe
+REALTIME_VAD_MODE=semantic_vad
+REALTIME_SAMPLE_RATE=24000
 PROVIDER_TIMEOUT_SECONDS=60
 PROVIDER_MAX_RETRIES=1
 ```
 
-`PLAYBACK_MODE=file-only` is the safest default because it guarantees MP3 stems in `audio/output/`. Once the stems are reliable, you can experiment with `PLAYBACK_MODE=sdk` or route system playback through a virtual audio cable.
+Realtime mode streams AI speech as it is generated, flushes playback when Florian starts talking, and stores host/AI WAV stems in `audio/<session_id>/`.
+
+For a chained external-voice fallback, set `CONVERSATION_MODE=chained`, choose `STT_MODE` and `TTS_MODE`, and retain the transcript-confirmation workflow below.
 
 ### Microphone Device
 
@@ -100,7 +103,7 @@ Create or select the AI co-host voice in ElevenLabs, then copy its voice ID into
 
 ```env
 ELEVENLABS_VOICE_ID=...
-ELEVENLABS_MODEL=eleven_multilingual_v3
+ELEVENLABS_MODEL=eleven_flash_v2_5
 ELEVENLABS_OUTPUT_FORMAT=mp3_22050_32
 ELEVENLABS_STABILITY=0.45
 ELEVENLABS_SIMILARITY_BOOST=0.80
@@ -108,7 +111,7 @@ ELEVENLABS_STYLE=0.35
 ELEVENLABS_SPEED=1.0
 ```
 
-These voice settings are conservative defaults. Tune them after a few short rehearsal clips.
+Flash v2.5 is the low-latency fallback default. Tune voice settings after a few short rehearsal clips, or use a richer non-live model when regenerating post-production audio.
 
 ### xAI Voice Option
 
@@ -124,14 +127,14 @@ XAI_TTS_VOICE=eve
 XAI_TTS_LANGUAGE=en
 ```
 
-The turn flow and saved artifacts stay the same. Host recordings are saved under `audio/input/`, and AI MP3 stems are saved under `audio/output/ai_turn_<n>.mp3`.
+The chained turn flow stays the same. New recordings are saved under session-scoped paths: `audio/<session_id>/input/` and `audio/<session_id>/output/`.
 
 ### OBS Audio Setup
 
 1. Install BlackHole 2ch on macOS or VB-Audio Cable on Windows/Linux.
 2. In OBS, add Florian's microphone as one audio source.
 3. Add the virtual cable as a second audio source if you want live AI playback recorded separately.
-4. Keep saved `audio/output/ai_turn_<n>.mp3` stems as the reliable fallback even if live routing fails.
+4. Keep saved stems in `audio/<session_id>/output/` as the reliable fallback even if live routing fails.
 5. Run a rehearsal and confirm OBS meters move for the intended sources.
 
 ## 2. Preflight Before Every Recording
@@ -198,16 +201,22 @@ Always run a one-turn rehearsal before the real recording:
 python main.py <episode_name> --confirm-transcript --max-turns 1
 ```
 
-For a real rehearsal using mic, Deepgram, LLM, and ElevenLabs:
+For the primary realtime rehearsal:
 
 ```bash
-INPUT_MODE=mic STT_MODE=deepgram TTS_MODE=elevenlabs python main.py pilot --confirm-transcript --max-turns 1
+CONVERSATION_MODE=realtime INPUT_MODE=mic OPENAI_API_KEY=<key> python main.py pilot
+```
+
+For a chained fallback rehearsal using mic, Deepgram, LLM, and ElevenLabs:
+
+```bash
+CONVERSATION_MODE=chained INPUT_MODE=mic STT_MODE=deepgram TTS_MODE=elevenlabs python main.py pilot --confirm-transcript --max-turns 1
 ```
 
 For a real rehearsal using xAI STT and xAI TTS:
 
 ```bash
-INPUT_MODE=mic STT_MODE=xai TTS_MODE=xai XAI_API_KEY=<key> python main.py pilot --confirm-transcript --max-turns 1
+CONVERSATION_MODE=chained INPUT_MODE=mic STT_MODE=xai TTS_MODE=xai XAI_API_KEY=<key> python main.py pilot --confirm-transcript --max-turns 1
 ```
 
 During mic mode:
@@ -221,10 +230,10 @@ During mic mode:
    - Type `e` to edit the transcript.
    - Type `s` to skip the turn.
    - Type `q` to end the episode.
-5. Confirm an AI MP3 appears in:
+5. Confirm an AI MP3 appears in the session output directory:
 
 ```text
-audio/output/ai_turn_0.mp3
+audio/<session_id>/output/turn_000000.mp3
 ```
 
 If the rehearsal is bad, tune `.env`, device settings, prompt context, or voice-provider settings before recording.
@@ -233,27 +242,24 @@ If the rehearsal is bad, tune `.env`, device settings, prompt context, or voice-
 
 Start OBS first. Confirm framing and audio meters.
 
-Then run:
+For realtime recording, run:
 
 ```bash
-python main.py <episode_name> --confirm-transcript
+CONVERSATION_MODE=realtime INPUT_MODE=mic python main.py <episode_name>
 ```
 
 Example:
 
 ```bash
-python main.py pilot --confirm-transcript
+CONVERSATION_MODE=realtime INPUT_MODE=mic python main.py pilot
 ```
 
 Recommended live rhythm:
 
-1. Ask or say your part naturally.
-2. Press Enter to stop recording.
-3. Confirm or edit the transcript.
-4. Wait while the LLM responds.
-5. Let the selected TTS provider generate the AI audio stem.
-6. Continue the conversation.
-7. Type or confirm `q`, `quit`, or `end` when finished.
+1. Speak naturally while the realtime session is active.
+2. Interrupt the AI naturally if you want to respond; playback is flushed on detected speech.
+3. Press Enter once to end the session.
+4. Inspect the saved session-local host and AI stems before editing.
 
 The system saves progress after each turn, so if something fails, you should still have a usable partial session.
 
@@ -281,22 +287,24 @@ Session JSON:
 sessions/<episode_name>_YYYYMMDD_HHMMSS.json
 ```
 
-Host microphone WAVs:
+Host and AI realtime WAV stems:
 
 ```text
-audio/input/host_turn_<n>.wav
+audio/<session_id>/input/live_host.wav
+audio/<session_id>/output/live_ai.wav
 ```
 
-AI ElevenLabs MP3 stems:
+Chained fallback stems:
 
 ```text
-audio/output/ai_turn_<n>.mp3
+audio/<session_id>/input/turn_<n>.wav
+audio/<session_id>/output/turn_<n>.mp3
 ```
 
 Dry-run AI text outputs:
 
 ```text
-audio/output/dryrun_ai_turn_<n>.txt
+audio/<session_id>/output/turn_<n>.txt
 ```
 
 Markdown transcript exports:

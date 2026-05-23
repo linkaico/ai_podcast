@@ -135,3 +135,32 @@ def test_transcribe_rejects_empty_deepgram_transcript(tmp_path):
             client_factory=lambda api_key: FakeClient(),
             options_factory=lambda **kwargs: kwargs,
         )
+
+
+def test_transcribe_supports_current_deepgram_media_contract(tmp_path):
+    audio_path = tmp_path / "host.wav"
+    audio_path.write_bytes(b"fake wav")
+    settings = Settings(
+        root_dir=tmp_path,
+        active_llm="dry-run",
+        active_model="dry-run-v1",
+        input_mode="mic",
+        deepgram_api_key="test-key",
+    )
+    captured = {}
+
+    class FakeMedia:
+        def transcribe_file(self, **kwargs):
+            captured.update(kwargs)
+            return {"results": {"channels": [{"alternatives": [{"transcript": "current sdk"}]}]}}
+
+    class FakeClient:
+        class listen:
+            class v1:
+                media = FakeMedia()
+
+    transcript = transcribe_with_client(audio_path, settings, client_factory=lambda _key: FakeClient())
+
+    assert transcript == "current sdk"
+    assert captured["request"] == b"fake wav"
+    assert captured["model"] == "nova-3"

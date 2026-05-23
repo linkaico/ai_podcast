@@ -10,6 +10,8 @@ sessions/*.json
 audio/input/*
 audio/output/*
 exports/*
+config/prompts/episodes/*.txt
 !audio/input/.gitkeep
 !audio/output/.gitkeep
 !exports/.gitkeep
+!config/prompts/episodes/.gitkeep

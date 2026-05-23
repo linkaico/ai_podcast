@@ -29,7 +29,13 @@ def test_preflight_reports_missing_deepgram_key_for_mic(tmp_path):
     prompts_dir = tmp_path / "config" / "prompts"
     prompts_dir.mkdir(parents=True)
     (prompts_dir / "base_system.txt").write_text("Base persona", encoding="utf-8")
-    settings = Settings(root_dir=tmp_path, active_llm="dry-run", active_model="dry-run-v1", input_mode="mic")
+    settings = Settings(
+        root_dir=tmp_path,
+        active_llm="dry-run",
+        active_model="dry-run-v1",
+        conversation_mode="chained",
+        input_mode="mic",
+    )
 
     result = run_preflight(settings)
 
@@ -45,6 +51,7 @@ def test_preflight_reports_missing_xai_key_for_xai_stt(tmp_path):
         root_dir=tmp_path,
         active_llm="dry-run",
         active_model="dry-run-v1",
+        conversation_mode="chained",
         input_mode="mic",
         stt_mode="xai",
     )
@@ -63,6 +70,7 @@ def test_preflight_xai_stt_does_not_require_deepgram_sdk(tmp_path, monkeypatch):
         root_dir=tmp_path,
         active_llm="dry-run",
         active_model="dry-run-v1",
+        conversation_mode="chained",
         input_mode="mic",
         stt_mode="xai",
         xai_api_key="test-key",
@@ -86,7 +94,13 @@ def test_preflight_reports_missing_elevenlabs_config(tmp_path):
     prompts_dir = tmp_path / "config" / "prompts"
     prompts_dir.mkdir(parents=True)
     (prompts_dir / "base_system.txt").write_text("Base persona", encoding="utf-8")
-    settings = Settings(root_dir=tmp_path, active_llm="dry-run", active_model="dry-run-v1", tts_mode="elevenlabs")
+    settings = Settings(
+        root_dir=tmp_path,
+        active_llm="dry-run",
+        active_model="dry-run-v1",
+        conversation_mode="chained",
+        tts_mode="elevenlabs",
+    )
 
     result = run_preflight(settings)
 
@@ -102,6 +116,7 @@ def test_preflight_reports_missing_elevenlabs_voice_id(tmp_path):
         root_dir=tmp_path,
         active_llm="dry-run",
         active_model="dry-run-v1",
+        conversation_mode="chained",
         tts_mode="elevenlabs",
         elevenlabs_api_key="test-key",
     )
@@ -116,7 +131,13 @@ def test_preflight_reports_missing_xai_key_for_xai_tts(tmp_path):
     prompts_dir = tmp_path / "config" / "prompts"
     prompts_dir.mkdir(parents=True)
     (prompts_dir / "base_system.txt").write_text("Base persona", encoding="utf-8")
-    settings = Settings(root_dir=tmp_path, active_llm="dry-run", active_model="dry-run-v1", tts_mode="xai")
+    settings = Settings(
+        root_dir=tmp_path,
+        active_llm="dry-run",
+        active_model="dry-run-v1",
+        conversation_mode="chained",
+        tts_mode="xai",
+    )
 
     result = run_preflight(settings)
 
@@ -135,3 +156,26 @@ def test_preflight_reports_unwritable_runtime_path(tmp_path):
 
     assert result["ok"] is False
     assert any(check["name"] == "sessions" and check["status"] == "error" for check in result["checks"])
+
+
+def test_preflight_realtime_requires_websocket_not_deepgram(tmp_path, monkeypatch):
+    prompts_dir = tmp_path / "config" / "prompts"
+    prompts_dir.mkdir(parents=True)
+    (prompts_dir / "base_system.txt").write_text("Base persona", encoding="utf-8")
+    settings = Settings(
+        root_dir=tmp_path,
+        active_llm="dry-run",
+        active_model="dry-run-v1",
+        conversation_mode="realtime",
+        openai_api_key="test-key",
+        input_mode="mic",
+        audio_device_index="default",
+    )
+    monkeypatch.setattr("pipeline.preflight.list_input_devices", lambda: [])
+    monkeypatch.setattr("pipeline.preflight.importlib.util.find_spec", lambda _module_name: object())
+
+    result = run_preflight(settings)
+
+    assert result["ok"] is True
+    assert any(check["name"] == "sdk:websockets" for check in result["checks"])
+    assert not any(check["name"] == "sdk:deepgram-sdk" for check in result["checks"])

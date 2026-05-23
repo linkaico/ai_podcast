@@ -38,6 +38,7 @@ def retry_call(
     max_retries: int,
     timeout_seconds: int,
     retry_exceptions: Iterable[type[BaseException]] = (Exception,),
+    retry_predicate: Callable[[BaseException], bool] | None = None,
     sleep_fn: Callable[[float], None] = time.sleep,
     backoff_seconds: float = 0.5,
 ) -> T:
@@ -57,7 +58,7 @@ def retry_call(
             return operation()
         except exceptions as exc:
             last_error = exc
-            if attempt >= attempts:
+            if attempt >= attempts or (retry_predicate is not None and not retry_predicate(exc)):
                 break
             sleep_fn(backoff_seconds * attempt)
 
@@ -67,6 +68,16 @@ def retry_call(
         attempts=attempts,
         original_error=str(last_error) if last_error else "unknown error",
     )
+
+
+def is_transient_provider_error(exc: BaseException) -> bool:
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+    status_code = getattr(exc, "status_code", None)
+    if status_code is None:
+        response = getattr(exc, "response", None)
+        status_code = getattr(response, "status_code", None)
+    return status_code in {408, 409, 429} or isinstance(status_code, int) and status_code >= 500
 
 
 def structured_error(exc: BaseException, stage: str) -> dict[str, Any]:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import sys
 from pathlib import Path
 from typing import Callable
@@ -9,6 +10,7 @@ from config.settings import Settings, load_settings
 from pipeline.llm import call_llm, load_system_prompt
 from pipeline.memory import ConversationMemory
 from pipeline.preflight import format_preflight_report, run_preflight
+from pipeline.realtime import run_realtime_episode
 from pipeline.reliability import structured_error
 from pipeline.stt import capture_text_turn, list_input_devices, record_until_keypress, transcribe
 from pipeline.tts import speak
@@ -31,8 +33,6 @@ def run_episode(
     if confirm_transcript is not None:
         active_settings = active_settings.with_overrides(confirm_transcript=confirm_transcript)
     active_settings.sessions_dir.mkdir(parents=True, exist_ok=True)
-    active_settings.audio_input_dir.mkdir(parents=True, exist_ok=True)
-    active_settings.audio_output_dir.mkdir(parents=True, exist_ok=True)
 
     if session_path:
         memory = ConversationMemory.from_session_file(session_path)
@@ -45,9 +45,10 @@ def run_episode(
             root_dir=active_settings.root_dir,
         )
 
-    system_prompt = load_system_prompt(episode_name=episode_name, settings=active_settings)
-    turn_index = memory.next_turn_index()
-    starting_turn_index = turn_index
+    memory.audio_input_dir.mkdir(parents=True, exist_ok=True)
+    memory.audio_output_dir.mkdir(parents=True, exist_ok=True)
+    system_prompt = load_system_prompt(episode_name=memory.episode_name, settings=active_settings)
+    completed_turns = 0
 
     output_fn(f"Episode: {memory.episode_name}")
     output_fn(f"Session: {memory.session_file}")
@@ -57,67 +58,74 @@ def run_episode(
         output_fn("Microphone input mode is active. Press ENTER after each recording.")
 
     while True:
-        if max_turns is not None and (turn_index - starting_turn_index) >= max_turns:
+        if max_turns is not None and completed_turns >= max_turns:
             output_fn("Max turns reached. Session saved.")
             break
 
+        turn_id = memory.reserve_turn_id()
         try:
             host_text, user_metadata = _capture_host_turn(
                 active_settings,
-                turn_index,
+                turn_id,
                 input_fn,
                 output_fn,
                 memory,
             )
         except Exception as exc:
-            memory.add_event("host_turn", "failed", turn_index, structured_error(exc, "host_turn"))
+            memory.add_event("host_turn", "failed", turn_id, structured_error(exc, "host_turn"))
             output_fn(f"Host turn failed: {exc}")
             break
 
         if host_text is None:
             output_fn("Turn skipped.")
-            memory.add_event("turn", "skipped", turn_index)
+            memory.add_event("turn", "skipped", turn_id)
             continue
         if host_text.lower() in EXIT_COMMANDS:
             output_fn("Episode ended. Session saved.")
-            memory.add_event("episode", "ended", turn_index)
+            memory.add_event("episode", "ended", turn_id)
             break
         if not host_text:
             output_fn("Empty turn skipped.")
-            memory.add_event("turn", "skipped_empty", turn_index)
+            memory.add_event("turn", "skipped_empty", turn_id)
             continue
 
         output_fn(f"FLORIAN: {host_text}")
-        memory.add("user", host_text, metadata={**(user_metadata or {}), "status": "transcript_confirmed"})
+        memory.add("user", host_text, metadata={**(user_metadata or {}), "turn_id": turn_id})
 
         try:
             output_fn("AI thinking...")
             ai_response = call_llm(memory.get(), system_prompt, active_settings)
-            memory.add_event("llm_completed", "ok", turn_index)
+            memory.add_event("llm_completed", "ok", turn_id)
             output_fn(f"AI: {ai_response}")
+            memory.add("assistant", ai_response, metadata={"status": "tts_pending", "turn_id": turn_id})
         except Exception as exc:
-            memory.add_event("llm_completed", "failed", turn_index, structured_error(exc, "llm_completed"))
+            memory.add_event("llm_completed", "failed", turn_id, structured_error(exc, "llm_completed"))
             output_fn(f"AI response failed: {exc}")
             break
 
         try:
-            ai_audio_path = speak(ai_response, turn_index, active_settings, output_fn=output_fn)
+            ai_audio_path = speak(
+                ai_response,
+                turn_id,
+                active_settings,
+                output_fn=output_fn,
+                output_dir=memory.audio_output_dir,
+            )
             assistant_metadata = {"status": "tts_saved"}
             if ai_audio_path:
                 assistant_metadata["audio_path"] = str(ai_audio_path)
-            memory.add("assistant", ai_response, metadata=assistant_metadata)
-            memory.add_event("tts_saved", "ok", turn_index, {"audio_path": str(ai_audio_path) if ai_audio_path else ""})
-            if active_settings.playback_mode != "file-only":
-                memory.add_event("playback_attempted", "ok", turn_index)
+            memory.update_turn_metadata("assistant", turn_id, **assistant_metadata)
+            memory.add_event("tts_saved", "ok", turn_id, {"audio_path": str(ai_audio_path) if ai_audio_path else ""})
             if ai_audio_path and active_settings.uses_live_tts:
                 output_fn(f"AI audio saved: {ai_audio_path}")
         except Exception as exc:
-            memory.add_event("tts_saved", "failed", turn_index, structured_error(exc, "tts_saved"))
+            memory.update_turn_metadata("assistant", turn_id, status="tts_failed")
+            memory.add_event("tts_saved", "failed", turn_id, structured_error(exc, "tts_saved"))
             output_fn(f"AI voice failed: {exc}")
             break
 
-        memory.add_event("turn", "complete", turn_index)
-        turn_index += 1
+        memory.add_event("turn", "complete", turn_id)
+        completed_turns += 1
 
     return memory
 
@@ -138,6 +146,7 @@ def _capture_host_turn(
             turn_index=turn_index,
             input_fn=input_fn,
             output_fn=output_fn,
+            output_dir=memory.audio_input_dir,
         )
         output_fn(f"Host audio saved: {audio_path}")
         memory.add_event("recording_saved", "ok", turn_index, {"audio_path": audio_path})
@@ -203,14 +212,24 @@ def main(argv: list[str] | None = None) -> int:
         if args.no_confirm_transcript:
             confirm_override = False
 
-        run_episode(
-            args.episode_name,
-            settings=settings,
-            resume=args.resume,
-            session_path=args.session,
-            max_turns=args.max_turns,
-            confirm_transcript=confirm_override,
-        )
+        if settings.uses_realtime:
+            asyncio.run(
+                run_realtime_episode(
+                    args.episode_name,
+                    settings,
+                    resume=args.resume,
+                    session_path=args.session,
+                )
+            )
+        else:
+            run_episode(
+                args.episode_name,
+                settings=settings,
+                resume=args.resume,
+                session_path=args.session,
+                max_turns=args.max_turns,
+                confirm_transcript=confirm_override,
+            )
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1

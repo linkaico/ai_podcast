@@ -107,3 +107,33 @@ def test_call_llm_openai_chat_mode_still_works(tmp_path):
     )
 
     assert response == "chat response"
+
+
+def test_call_llm_google_uses_supported_client_contract(tmp_path):
+    settings = Settings(
+        root_dir=tmp_path,
+        active_llm="google",
+        active_model="gemini-test",
+        google_api_key="test-key",
+        provider_max_retries=0,
+    )
+    captured = {}
+
+    class FakeModels:
+        def generate_content(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(text="google response")
+
+    class FakeClient:
+        models = FakeModels()
+
+    response = call_llm(
+        [{"role": "user", "content": "hello"}],
+        "System prompt",
+        settings,
+        client_factories={"google": lambda **_kwargs: FakeClient()},
+    )
+
+    assert response == "google response"
+    assert captured["model"] == "gemini-test"
+    assert captured["config"]["system_instruction"] == "System prompt"

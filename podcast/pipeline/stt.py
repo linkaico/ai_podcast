@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import mimetypes
+import os
 from pathlib import Path
 from typing import Any, Callable
+from uuid import uuid4
 
 from config.settings import Settings
-from pipeline.reliability import retry_call
+from pipeline.reliability import is_transient_provider_error, retry_call
 
 
 def capture_text_turn(input_fn: Callable[[str], str] = input, prompt: str = "FLORIAN> ") -> str:
@@ -39,6 +41,7 @@ def record_until_keypress(
     turn_index: int = 0,
     input_fn: Callable[[str], str] = input,
     output_fn: Callable[[str], None] | None = None,
+    output_dir: str | Path | None = None,
 ) -> str:
     """Record microphone audio until ENTER is pressed and save a WAV file."""
     if not settings.uses_microphone_input:
@@ -53,7 +56,8 @@ def record_until_keypress(
             "Install sounddevice, soundfile, and numpy to use INPUT_MODE=mic."
         ) from exc
 
-    settings.audio_input_dir.mkdir(parents=True, exist_ok=True)
+    recording_dir = Path(output_dir) if output_dir else settings.audio_input_dir
+    recording_dir.mkdir(parents=True, exist_ok=True)
     audio_chunks = []
 
     def callback(indata: Any, frames: int, time_info: Any, status: Any) -> None:
@@ -81,8 +85,10 @@ def record_until_keypress(
     if audio_data.size == 0:
         raise RuntimeError("Captured microphone audio was empty.")
 
-    path = settings.audio_input_dir / f"host_turn_{turn_index}.wav"
-    sf.write(path, audio_data, settings.audio_sample_rate)
+    path = recording_dir / f"turn_{turn_index:06d}.wav"
+    temporary_path = path.with_name(f".{path.stem}.{uuid4().hex}.tmp.wav")
+    sf.write(temporary_path, audio_data, settings.audio_sample_rate)
+    os.replace(temporary_path, path)
     return str(path)
 
 
@@ -129,31 +135,29 @@ def _transcribe_with_deepgram_provider(
     if path.stat().st_size == 0:
         raise RuntimeError(f"Audio file is empty: {path}")
 
-    if client_factory is None or options_factory is None:
+    using_default_client = client_factory is None
+    if using_default_client:
         try:
-            from deepgram import DeepgramClient, PrerecordedOptions
+            from deepgram import DeepgramClient
         except ImportError as exc:
             raise RuntimeError("Install deepgram-sdk to use INPUT_MODE=mic transcription.") from exc
 
-        client_factory = client_factory or DeepgramClient
-        options_factory = options_factory or PrerecordedOptions
-
-    client = client_factory(settings.deepgram_api_key)
-    options = options_factory(
-        model=settings.deepgram_model,
-        language="en",
-        smart_format=True,
-    )
+        client = DeepgramClient(api_key=settings.deepgram_api_key, timeout=settings.provider_timeout_seconds)
+        options = None
+    else:
+        client = client_factory(settings.deepgram_api_key)
+        options = options_factory(model=settings.deepgram_model, language="en", smart_format=True) if options_factory else None
 
     with path.open("rb") as audio_file:
         buffer_data = audio_file.read()
 
     response = retry_call(
-        lambda: _transcribe_with_deepgram(client, buffer_data, options),
+        lambda: _transcribe_with_deepgram(client, buffer_data, options, settings),
         provider="deepgram",
         stage="transcribe",
         max_retries=settings.provider_max_retries,
         timeout_seconds=settings.provider_timeout_seconds,
+        retry_predicate=is_transient_provider_error,
     )
     transcript = _extract_transcript(response)
     if not transcript:
@@ -190,6 +194,7 @@ def _transcribe_with_xai(
         stage="transcribe",
         max_retries=settings.provider_max_retries,
         timeout_seconds=settings.provider_timeout_seconds,
+        retry_predicate=is_transient_provider_error,
     )
     transcript = _extract_xai_transcript(response)
     if not transcript:
@@ -207,11 +212,22 @@ def _input_device(audio_device_index: str) -> int | str | None:
         return value
 
 
-def _transcribe_with_deepgram(client: Any, buffer_data: bytes, options: Any) -> Any:
+def _transcribe_with_deepgram(client: Any, buffer_data: bytes, options: Any, settings: Settings) -> Any:
     source = {"buffer": buffer_data}
     listen = getattr(client, "listen", None)
     if listen is None:
         raise RuntimeError("Deepgram client does not expose a listen API.")
+
+    v1 = getattr(listen, "v1", None)
+    media = getattr(v1, "media", None)
+    if media is not None:
+        return media.transcribe_file(
+            request=buffer_data,
+            model=settings.deepgram_model,
+            language="en",
+            smart_format=True,
+            request_options={"timeout_in_seconds": settings.provider_timeout_seconds},
+        )
 
     rest = getattr(listen, "rest", None)
     if rest is not None:

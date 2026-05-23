@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import subprocess
 import sys
 from typing import Any, Callable, Iterable
+from uuid import uuid4
 
 from config.settings import Settings
-from pipeline.reliability import retry_call
+from pipeline.reliability import is_transient_provider_error, retry_call
 
 
 def speak(
@@ -14,9 +16,10 @@ def speak(
     turn_index: int,
     settings: Settings,
     output_fn: Callable[[str], None] | None = None,
+    output_dir: str | Path | None = None,
 ) -> Path | None:
     """Speak an AI turn or save a dry-run text artifact."""
-    return speak_with_client(text, turn_index, settings, output_fn=output_fn)
+    return speak_with_client(text, turn_index, settings, output_fn=output_fn, output_dir=output_dir)
 
 
 def speak_with_client(
@@ -27,12 +30,14 @@ def speak_with_client(
     client_factory: Callable[[str], Any] | None = None,
     stream_fn: Callable[[Any], None] | None = None,
     http_post: Callable[..., Any] | None = None,
+    output_dir: str | Path | None = None,
 ) -> Path | None:
     """Speak an AI turn, with injectable provider hooks for tests."""
     if settings.uses_dry_run_tts:
-        settings.audio_output_dir.mkdir(parents=True, exist_ok=True)
-        output_path = settings.audio_output_dir / f"dryrun_ai_turn_{turn_index}.txt"
-        output_path.write_text(text, encoding="utf-8")
+        voice_dir = Path(output_dir) if output_dir else settings.audio_output_dir
+        voice_dir.mkdir(parents=True, exist_ok=True)
+        output_path = voice_dir / f"turn_{turn_index:06d}.txt"
+        _atomic_write_text(output_path, text)
         if output_fn:
             output_fn(f"[dry-run voice saved] {output_path}")
         return output_path
@@ -45,6 +50,7 @@ def speak_with_client(
             output_fn=output_fn,
             stream_fn=stream_fn,
             http_post=http_post,
+            output_dir=output_dir,
         )
 
     return _speak_with_elevenlabs(
@@ -54,6 +60,7 @@ def speak_with_client(
         output_fn=output_fn,
         client_factory=client_factory,
         stream_fn=stream_fn,
+        output_dir=output_dir,
     )
 
 
@@ -64,6 +71,7 @@ def _speak_with_elevenlabs(
     output_fn: Callable[[str], None] | None = None,
     client_factory: Callable[[str], Any] | None = None,
     stream_fn: Callable[[Any], None] | None = None,
+    output_dir: str | Path | None = None,
 ) -> Path:
     """Speak an AI turn with ElevenLabs."""
     if not settings.elevenlabs_api_key:
@@ -77,11 +85,12 @@ def _speak_with_elevenlabs(
         except ImportError as exc:
             raise RuntimeError("Install elevenlabs to use TTS_MODE=elevenlabs.") from exc
 
-        client_factory = ElevenLabs
-
-    client = client_factory(settings.elevenlabs_api_key)
-    settings.audio_output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = settings.audio_output_dir / f"ai_turn_{turn_index}.mp3"
+        client = ElevenLabs(api_key=settings.elevenlabs_api_key, timeout=settings.provider_timeout_seconds)
+    else:
+        client = client_factory(settings.elevenlabs_api_key)
+    voice_dir = Path(output_dir) if output_dir else settings.audio_output_dir
+    voice_dir.mkdir(parents=True, exist_ok=True)
+    output_path = voice_dir / f"turn_{turn_index:06d}.{_elevenlabs_extension(settings.elevenlabs_output_format)}"
 
     audio_result = retry_call(
         lambda: client.text_to_speech.convert(
@@ -95,12 +104,13 @@ def _speak_with_elevenlabs(
         stage="tts",
         max_retries=settings.provider_max_retries,
         timeout_seconds=settings.provider_timeout_seconds,
+        retry_predicate=is_transient_provider_error,
     )
     audio_bytes = _coerce_audio_bytes(audio_result)
     if not audio_bytes:
         raise RuntimeError("ElevenLabs returned empty audio.")
 
-    output_path.write_bytes(audio_bytes)
+    _atomic_write_bytes(output_path, audio_bytes)
     if output_fn:
         output_fn(f"[AI voice saved] {output_path}")
 
@@ -115,6 +125,7 @@ def _speak_with_xai(
     output_fn: Callable[[str], None] | None = None,
     stream_fn: Callable[[Any], None] | None = None,
     http_post: Callable[..., Any] | None = None,
+    output_dir: str | Path | None = None,
 ) -> Path:
     """Speak an AI turn with xAI's REST TTS endpoint."""
     if not settings.xai_api_key:
@@ -128,20 +139,22 @@ def _speak_with_xai(
 
         http_post = requests.post
 
-    settings.audio_output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = settings.audio_output_dir / f"ai_turn_{turn_index}.mp3"
+    voice_dir = Path(output_dir) if output_dir else settings.audio_output_dir
+    voice_dir.mkdir(parents=True, exist_ok=True)
+    output_path = voice_dir / f"turn_{turn_index:06d}.mp3"
     response = retry_call(
         lambda: _post_xai_tts(text, settings, http_post),
         provider="xai",
         stage="tts",
         max_retries=settings.provider_max_retries,
         timeout_seconds=settings.provider_timeout_seconds,
+        retry_predicate=is_transient_provider_error,
     )
     audio_bytes = _response_content(response)
     if not audio_bytes:
         raise RuntimeError("xAI returned empty audio.")
 
-    output_path.write_bytes(audio_bytes)
+    _atomic_write_bytes(output_path, audio_bytes)
     if output_fn:
         output_fn(f"[AI voice saved] {output_path}")
 
@@ -183,6 +196,25 @@ def _coerce_audio_bytes(audio_result: bytes | bytearray | Iterable[bytes]) -> by
     if isinstance(audio_result, bytearray):
         return bytes(audio_result)
     return b"".join(chunk for chunk in audio_result if chunk)
+
+
+def _elevenlabs_extension(output_format: str) -> str:
+    extension = output_format.split("_", 1)[0].lower()
+    if extension not in {"mp3", "pcm", "ulaw", "alaw", "opus"}:
+        raise RuntimeError(f"Unsupported ElevenLabs output format: {output_format}")
+    return extension
+
+
+def _atomic_write_bytes(path: Path, content: bytes) -> None:
+    temporary_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    temporary_path.write_bytes(content)
+    os.replace(temporary_path, path)
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    temporary_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    temporary_path.write_text(content, encoding="utf-8")
+    os.replace(temporary_path, path)
 
 
 def _voice_settings(settings: Settings) -> Any:

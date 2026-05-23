@@ -11,7 +11,7 @@ def test_dry_run_tts_writes_text_artifact(tmp_path):
 
     output_path = speak("hello voice", 3, settings)
 
-    assert output_path == tmp_path / "audio" / "output" / "dryrun_ai_turn_3.txt"
+    assert output_path == tmp_path / "audio" / "output" / "turn_000003.txt"
     assert output_path.read_text(encoding="utf-8") == "hello voice"
 
 
@@ -54,7 +54,7 @@ def test_elevenlabs_tts_writes_mp3_from_mocked_audio(tmp_path):
         def convert(self, voice_id, text, model_id, output_format=None, voice_settings=None):
             assert voice_id == "voice-123"
             assert text == "hello"
-            assert model_id == "eleven_multilingual_v3"
+            assert model_id == "eleven_flash_v2_5"
             assert output_format == "mp3_22050_32"
             assert voice_settings is not None
             return [b"mp3", b"-bytes"]
@@ -69,7 +69,7 @@ def test_elevenlabs_tts_writes_mp3_from_mocked_audio(tmp_path):
         client_factory=lambda api_key: FakeClient(),
     )
 
-    assert output_path == tmp_path / "audio" / "output" / "ai_turn_2.mp3"
+    assert output_path == tmp_path / "audio" / "output" / "turn_000002.mp3"
     assert output_path.read_bytes() == b"mp3-bytes"
 
 
@@ -105,7 +105,7 @@ def test_xai_tts_writes_mp3_from_mocked_audio(tmp_path):
         http_post=fake_http_post,
     )
 
-    assert output_path == tmp_path / "audio" / "output" / "ai_turn_4.mp3"
+    assert output_path == tmp_path / "audio" / "output" / "turn_000004.mp3"
     assert output_path.read_bytes() == b"xai-mp3"
     assert captured["url"] == "https://api.x.ai/v1/tts"
     assert captured["headers"] == {
@@ -152,3 +152,24 @@ def test_playback_failure_keeps_saved_mp3(tmp_path):
 
     assert output_path.read_bytes() == b"mp3"
     assert any("playback skipped" in line for line in outputs)
+
+
+def test_elevenlabs_tts_uses_extension_from_output_format(tmp_path):
+    settings = Settings(
+        root_dir=tmp_path,
+        active_llm="dry-run",
+        active_model="dry-run-v1",
+        tts_mode="elevenlabs",
+        elevenlabs_api_key="test-key",
+        elevenlabs_voice_id="voice-123",
+        elevenlabs_output_format="pcm_24000",
+    )
+
+    class FakeClient:
+        class text_to_speech:
+            @staticmethod
+            def convert(**kwargs):
+                return [b"pcm"]
+
+    output_path = speak_with_client("hello", 5, settings, client_factory=lambda _key: FakeClient())
+    assert output_path.suffix == ".pcm"

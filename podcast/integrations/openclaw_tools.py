@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -8,6 +9,7 @@ from typing import Any
 from config.settings import PROJECT_ROOT, load_settings
 from main import run_episode as _run_episode
 from pipeline.memory import ConversationMemory, safe_episode_name
+from pipeline.realtime import run_realtime_episode as _run_realtime_episode
 
 
 def run_episode(
@@ -18,13 +20,18 @@ def run_episode(
 ) -> dict[str, Any]:
     """Run an episode and return machine-readable session metadata."""
     settings = load_settings()
-    memory = _run_episode(
-        name,
-        settings=settings,
-        resume=resume,
-        session_path=session_path,
-        max_turns=max_turns,
-    )
+    if settings.uses_realtime:
+        memory = asyncio.run(
+            _run_realtime_episode(name, settings, resume=resume, session_path=session_path)
+        )
+    else:
+        memory = _run_episode(
+            name,
+            settings=settings,
+            resume=resume,
+            session_path=session_path,
+            max_turns=max_turns,
+        )
     return _session_metadata(memory.session_file)
 
 

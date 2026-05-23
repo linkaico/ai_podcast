@@ -1,13 +1,14 @@
 # AI Podcast Backend
 
-This is the local foundation slice for Florian's AI video podcast backend. It creates a safe offline version of the STT -> LLM -> TTS loop so the project can be tested without microphones, OBS routing, Deepgram, ElevenLabs, or frontier-model API keys.
+This is the local backend for Florian's AI video podcast. It supports a native low-latency OpenAI Realtime conversation for recording and preserves a chained STT -> LLM -> TTS fallback plus a safe offline dry-run mode.
 
 ## What Works Now
 
 - `python main.py pilot` starts a typed dry-run episode loop.
-- Host turns are saved to `sessions/*.json` after every turn.
+- `CONVERSATION_MODE=realtime INPUT_MODE=mic python main.py pilot` starts native speech-to-speech recording with barge-in.
+- Host turns are saved to `sessions/*.json` after every turn and media lives beneath a unique session directory.
 - Dry-run AI responses are generated locally through the LLM adapter.
-- Dry-run voice artifacts are saved as `audio/output/dryrun_ai_turn_*.txt`.
+- Dry-run voice artifacts are saved beneath `audio/<session_id>/output/turn_*.txt`.
 - `INPUT_MODE=mic` records host WAV files and transcribes them with Deepgram or xAI.
 - `TTS_MODE=elevenlabs` or `TTS_MODE=xai` generates MP3 stems for the AI voice.
 - Base and per-episode prompts are loaded from `config/prompts/`.
@@ -24,7 +25,31 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-The default `.env.example` uses `ACTIVE_LLM=dry-run`, `INPUT_MODE=text`, and `TTS_MODE=dry-run`, which do not require API keys.
+The default `.env.example` uses `CONVERSATION_MODE=dry-run`, `ACTIVE_LLM=dry-run`, `INPUT_MODE=text`, and `TTS_MODE=dry-run`, which do not require API keys.
+
+## Primary Live Recording: OpenAI Realtime
+
+Set:
+
+```env
+CONVERSATION_MODE=realtime
+OPENAI_API_KEY=your_key_here
+INPUT_MODE=mic
+REALTIME_MODEL=gpt-realtime
+REALTIME_VOICE=marin
+REALTIME_TRANSCRIPTION_MODEL=gpt-4o-transcribe
+REALTIME_VAD_MODE=semantic_vad
+REALTIME_SAMPLE_RATE=24000
+```
+
+Then run:
+
+```bash
+python main.py pilot --doctor
+python main.py pilot
+```
+
+Realtime mode streams microphone PCM audio and AI audio over WebSocket, automatically interrupts AI playback when you begin speaking, and records session-local `live_host.wav` and `live_ai.wav` stems for editing.
 
 ## Run A Dry-Run Episode
 
@@ -58,12 +83,13 @@ List available microphone input devices:
 python main.py --list-devices
 ```
 
-## Run With Microphone Input
+## Chained Fallback With Microphone Input
 
 Set these values in `.env`:
 
 ```env
 INPUT_MODE=mic
+CONVERSATION_MODE=chained
 STT_MODE=deepgram
 DEEPGRAM_API_KEY=your_key_here
 DEEPGRAM_MODEL=nova-3
@@ -78,7 +104,7 @@ Then run:
 python main.py pilot
 ```
 
-Each host turn records until you press Enter, saves a WAV file to `audio/input/host_turn_<n>.wav`, then sends it to Deepgram for transcription.
+Each host turn records until you press Enter, saves a WAV file under `audio/<session_id>/input/turn_<n>.wav`, then sends it to Deepgram for transcription.
 
 To use xAI instead of Deepgram for transcription:
 
@@ -113,12 +139,12 @@ Set these values in `.env`:
 TTS_MODE=elevenlabs
 ELEVENLABS_API_KEY=your_key_here
 ELEVENLABS_VOICE_ID=your_voice_id_here
-ELEVENLABS_MODEL=eleven_multilingual_v3
+ELEVENLABS_MODEL=eleven_flash_v2_5
 ELEVENLABS_OUTPUT_FORMAT=mp3_22050_32
 PLAYBACK_MODE=file-only
 ```
 
-Each AI turn saves an MP3 stem to `audio/output/ai_turn_<n>.mp3`. Playback through the ElevenLabs SDK is best-effort; the saved MP3 is the guaranteed artifact.
+Each AI turn saves a stem inside `audio/<session_id>/output/turn_<n>.mp3`. Playback through the ElevenLabs SDK is best-effort; the saved artifact is the reliable fallback.
 
 ## Run With xAI Voice Output
 
@@ -132,7 +158,7 @@ XAI_TTS_LANGUAGE=en
 PLAYBACK_MODE=file-only
 ```
 
-Each AI turn saves an MP3 stem to `audio/output/ai_turn_<n>.mp3`, matching the ElevenLabs artifact path.
+Each AI turn saves an MP3 stem inside `audio/<session_id>/output/turn_<n>.mp3`, matching the ElevenLabs artifact layout.
 
 ## Real Recording Checklist
 
@@ -145,8 +171,8 @@ INPUT_MODE=mic STT_MODE=xai TTS_MODE=xai XAI_API_KEY=<key> ACTIVE_LLM=<provider>
 ```
 
 4. Start OBS and confirm Florian's mic and the AI voice track are both visible.
-5. Run the real episode with `python main.py <episode_name> --confirm-transcript`.
-6. After recording, use `sessions/*.json`, `audio/input/*.wav`, `audio/output/*.mp3`, and `exports/*.md` as the editing source of truth.
+5. Prefer the realtime episode with `CONVERSATION_MODE=realtime INPUT_MODE=mic python main.py <episode_name>`.
+6. After recording, use `sessions/*.json`, `audio/<session_id>/`, and `exports/*.md` as the editing source of truth.
 
 ## OBS Routing Checklist
 
@@ -154,7 +180,7 @@ INPUT_MODE=mic STT_MODE=xai TTS_MODE=xai XAI_API_KEY=<key> ACTIVE_LLM=<provider>
 2. In OBS, add one Audio Input Capture source for Florian's microphone.
 3. Add a second Audio Input Capture source for BlackHole/VB-Audio.
 4. Route system or SDK playback to the virtual cable when recording live.
-5. Import `audio/output/ai_turn_<n>.mp3` stems into Descript or your editor if live routing is not clean enough.
+5. Import the AI stems from `audio/<session_id>/output/` into Descript or your editor if live routing is not clean enough.
 
 ## OpenClaw Integration
 

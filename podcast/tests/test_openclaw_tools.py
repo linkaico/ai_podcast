@@ -53,18 +53,21 @@ def test_session_listing_loading_and_latest_session(tmp_path):
 
 
 def test_episode_artifacts_finds_saved_files(tmp_path):
-    (tmp_path / "audio" / "input").mkdir(parents=True)
-    (tmp_path / "audio" / "output").mkdir(parents=True)
-    (tmp_path / "audio" / "input" / "host_turn_0.wav").write_bytes(b"wav")
-    (tmp_path / "audio" / "output" / "ai_turn_0.mp3").write_bytes(b"mp3")
     memory = ConversationMemory("pilot", sessions_dir=tmp_path / "sessions", root_dir=tmp_path)
-    memory.add("user", "hello")
+    input_path = memory.audio_input_dir / "turn_000000.wav"
+    output_path = memory.audio_output_dir / "turn_000000.mp3"
+    input_path.parent.mkdir(parents=True)
+    output_path.parent.mkdir(parents=True)
+    input_path.write_bytes(b"wav")
+    output_path.write_bytes(b"mp3")
+    memory.add("user", "hello", metadata={"audio_path": str(input_path)})
+    memory.add("assistant", "hi", metadata={"audio_path": str(output_path)})
 
     result = episode_artifacts("pilot", root_dir=tmp_path)
 
     assert result["episode"] == "pilot"
-    assert result["artifacts"]["input_wav"] == ["audio/input/host_turn_0.wav"]
-    assert result["artifacts"]["output_mp3"] == ["audio/output/ai_turn_0.mp3"]
+    assert result["artifacts"]["input_wav"] == [str(input_path.relative_to(tmp_path))]
+    assert result["artifacts"]["output_mp3"] == [str(output_path.relative_to(tmp_path))]
 
 
 def test_export_transcript_writes_markdown(tmp_path):

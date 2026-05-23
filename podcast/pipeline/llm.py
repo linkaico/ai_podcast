@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from config.settings import PROJECT_ROOT, Settings, load_settings
-from pipeline.reliability import retry_call
+from pipeline.reliability import is_transient_provider_error, retry_call
 
 
 def load_system_prompt(
@@ -48,6 +48,7 @@ def call_llm(
         stage="llm",
         max_retries=active_settings.provider_max_retries,
         timeout_seconds=active_settings.provider_timeout_seconds,
+        retry_predicate=is_transient_provider_error,
     )
     if not response.strip():
         raise RuntimeError(f"{active_settings.active_llm} returned an empty response.")
@@ -147,26 +148,26 @@ def _call_google(
     settings: Settings,
     client_factory: Callable[..., Any] | None = None,
 ) -> str:
-    try:
-        import google.generativeai as genai
-    except ImportError as exc:
-        raise RuntimeError("Install google-generativeai to use ACTIVE_LLM=google.") from exc
-
-    if client_factory is None:
-        genai.configure(api_key=settings.google_api_key)
-        model = genai.GenerativeModel(model_name=settings.active_model, system_instruction=system_prompt)
+    if client_factory is not None:
+        client = client_factory(api_key=settings.google_api_key)
     else:
-        model = client_factory(model_name=settings.active_model, system_instruction=system_prompt)
-    chat_history = [
+        try:
+            from google import genai
+        except ImportError as exc:
+            raise RuntimeError("Install google-genai to use ACTIVE_LLM=google.") from exc
+        client = genai.Client(api_key=settings.google_api_key)
+    contents = [
         {
             "role": "model" if message["role"] == "assistant" else "user",
-            "parts": [message["content"]],
+            "parts": [{"text": message["content"]}],
         }
-        for message in messages[:-1]
+        for message in messages
     ]
-    chat = model.start_chat(history=chat_history)
-    prompt = messages[-1]["content"] if messages else ""
-    response = chat.send_message(prompt, request_options={"timeout": settings.provider_timeout_seconds})
+    response = client.models.generate_content(
+        model=settings.active_model,
+        contents=contents,
+        config={"system_instruction": system_prompt},
+    )
     return response.text or ""
 
 

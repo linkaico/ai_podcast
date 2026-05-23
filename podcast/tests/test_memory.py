@@ -84,16 +84,32 @@ def test_latest_for_episode_loads_newest_matching_session(tmp_path):
 
 def test_memory_artifacts_discovers_audio_outputs(tmp_path):
     root = tmp_path
-    (root / "audio" / "input").mkdir(parents=True)
-    (root / "audio" / "output").mkdir(parents=True)
-    (root / "audio" / "input" / "host_turn_0.wav").write_bytes(b"wav")
-    (root / "audio" / "output" / "ai_turn_0.mp3").write_bytes(b"mp3")
-    (root / "audio" / "output" / "dryrun_ai_turn_0.txt").write_text("text", encoding="utf-8")
-
     memory = ConversationMemory("pilot", sessions_dir=root / "sessions", root_dir=root, now_fn=fixed_now)
+    input_path = memory.audio_input_dir / "turn_000000.wav"
+    output_path = memory.audio_output_dir / "turn_000000.mp3"
+    text_path = memory.audio_output_dir / "turn_000000.txt"
+    input_path.parent.mkdir(parents=True)
+    output_path.parent.mkdir(parents=True)
+    input_path.write_bytes(b"wav")
+    output_path.write_bytes(b"mp3")
+    text_path.write_text("text", encoding="utf-8")
+    memory.register_artifact(input_path)
+    memory.register_artifact(output_path)
+    memory.register_artifact(text_path)
 
     assert memory.artifacts() == {
-        "input_wav": ["audio/input/host_turn_0.wav"],
-        "output_mp3": ["audio/output/ai_turn_0.mp3"],
-        "dryrun_text": ["audio/output/dryrun_ai_turn_0.txt"],
+        "input_wav": [str(input_path.relative_to(root))],
+        "output_mp3": [str(output_path.relative_to(root))],
+        "dryrun_text": [str(text_path.relative_to(root))],
     }
+
+
+def test_sessions_use_distinct_media_directories_and_monotonic_turn_ids(tmp_path):
+    first = ConversationMemory("pilot", sessions_dir=tmp_path / "sessions", root_dir=tmp_path, now_fn=fixed_now)
+    second = ConversationMemory("pilot", sessions_dir=tmp_path / "sessions", root_dir=tmp_path, now_fn=fixed_now)
+
+    assert first.session_id != second.session_id
+    assert first.audio_output_dir != second.audio_output_dir
+    for expected in range(43):
+        assert first.reserve_turn_id() == expected
+    assert first.next_turn_index() == 43

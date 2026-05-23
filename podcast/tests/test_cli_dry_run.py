@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from config.settings import Settings
 from main import main, run_episode
@@ -23,7 +24,7 @@ def test_run_episode_dry_run_saves_session_and_voice_artifact(tmp_path):
     )
 
     session_files = list((tmp_path / "sessions").glob("pilot_*.json"))
-    voice_files = list((tmp_path / "audio" / "output").glob("dryrun_ai_turn_0.txt"))
+    voice_files = list(memory.audio_output_dir.glob("turn_000000.txt"))
 
     assert memory.get()[0]["content"] == "Hello from the host"
     assert len(session_files) == 1
@@ -50,9 +51,9 @@ def test_run_episode_mic_mode_uses_recording_and_transcription(tmp_path, monkeyp
     )
     outputs: list[str] = []
 
-    def fake_record(settings, turn_index, input_fn, output_fn):
+    def fake_record(settings, turn_index, input_fn, output_fn, output_dir=None):
         assert turn_index == 0
-        path = tmp_path / "audio" / "input" / "host_turn_0.wav"
+        path = output_dir / "turn_000000.wav"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"fake wav")
         return str(path)
@@ -80,8 +81,8 @@ def test_run_episode_mic_mode_accepts_confirmed_transcript(tmp_path, monkeypatch
         confirm_transcript=True,
     )
 
-    def fake_record(settings, turn_index, input_fn, output_fn):
-        path = tmp_path / "audio" / "input" / "host_turn_0.wav"
+    def fake_record(settings, turn_index, input_fn, output_fn, output_dir=None):
+        path = output_dir / "turn_000000.wav"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"fake wav")
         return str(path)
@@ -114,8 +115,8 @@ def test_run_episode_mic_mode_can_edit_skip_and_quit(tmp_path, monkeypatch):
         confirm_transcript=True,
     )
 
-    def fake_record(settings, turn_index, input_fn, output_fn):
-        path = tmp_path / "audio" / "input" / f"host_turn_{turn_index}.wav"
+    def fake_record(settings, turn_index, input_fn, output_fn, output_dir=None):
+        path = output_dir / f"turn_{turn_index:06d}.wav"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"fake wav")
         return str(path)
@@ -167,9 +168,9 @@ def test_run_episode_mic_mode_can_re_record(tmp_path, monkeypatch):
     )
     calls = {"count": 0}
 
-    def fake_record(settings, turn_index, input_fn, output_fn):
+    def fake_record(settings, turn_index, input_fn, output_fn, output_dir=None):
         calls["count"] += 1
-        path = tmp_path / "audio" / "input" / f"host_turn_{turn_index}_{calls['count']}.wav"
+        path = output_dir / f"turn_{turn_index:06d}_{calls['count']}.wav"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"fake wav")
         return str(path)
@@ -237,6 +238,27 @@ def test_run_episode_records_error_event_on_llm_failure(tmp_path, monkeypatch):
     assert any(event["stage"] == "llm_completed" and event["status"] == "failed" for event in memory.events)
 
 
+def test_run_episode_keeps_ai_text_when_tts_fails(tmp_path, monkeypatch):
+    prompts_dir = tmp_path / "config" / "prompts"
+    prompts_dir.mkdir(parents=True)
+    (prompts_dir / "base_system.txt").write_text("Base persona", encoding="utf-8")
+    settings = Settings(root_dir=tmp_path, active_llm="dry-run", active_model="dry-run-v1")
+
+    monkeypatch.setattr("main.call_llm", lambda *_args: "usable ai answer")
+    monkeypatch.setattr("main.speak", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("voice down")))
+
+    memory = run_episode(
+        "pilot",
+        settings=settings,
+        input_fn=lambda _prompt: "host turn",
+        output_fn=lambda _line: None,
+        max_turns=1,
+    )
+
+    assert [turn["content"] for turn in memory.get()] == ["host turn", "usable ai answer"]
+    assert memory.get()[-1]["metadata"]["status"] == "tts_failed"
+
+
 def test_run_episode_uses_exact_session_path(tmp_path):
     prompts_dir = tmp_path / "config" / "prompts"
     prompts_dir.mkdir(parents=True)
@@ -284,6 +306,27 @@ def test_main_doctor_runs_preflight(monkeypatch, capsys):
 
     captured = capsys.readouterr()
     assert "doctor ok" in captured.out
+
+
+def test_main_dispatches_realtime_mode(monkeypatch):
+    calls = []
+    settings = Settings(
+        root_dir=Path("."),
+        active_llm="dry-run",
+        active_model="dry-run-v1",
+        conversation_mode="realtime",
+        input_mode="mic",
+        openai_api_key="test-key",
+    )
+
+    async def fake_run_realtime_episode(episode_name, passed_settings, resume=False, session_path=None):
+        calls.append((episode_name, passed_settings, resume, session_path))
+
+    monkeypatch.setattr("main.load_settings", lambda validate=True: settings)
+    monkeypatch.setattr("main.run_realtime_episode", fake_run_realtime_episode)
+
+    assert main(["pilot"]) == 0
+    assert calls == [("pilot", settings, False, None)]
 
 
 def test_main_list_devices_prints_devices(monkeypatch, capsys):

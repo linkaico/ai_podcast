@@ -66,12 +66,12 @@ def _check_writable_dir(name: str, path: Path) -> dict[str, str]:
 
 def _check_provider_sdks(settings: Settings) -> list[dict[str, str]]:
     checks = []
-    if settings.active_llm == "anthropic":
+    if settings.active_llm == "anthropic" and not settings.uses_realtime:
         checks.append(_check_import("anthropic", "anthropic"))
-    if settings.active_llm == "openai":
+    if settings.active_llm == "openai" and not settings.uses_realtime:
         checks.append(_check_import("openai", "openai"))
-    if settings.active_llm == "google":
-        checks.append(_check_import("google.generativeai", "google-generativeai"))
+    if settings.active_llm == "google" and not settings.uses_realtime:
+        checks.append(_check_import("google.genai", "google-genai"))
     if settings.uses_microphone_input:
         checks.extend(
             [
@@ -80,13 +80,15 @@ def _check_provider_sdks(settings: Settings) -> list[dict[str, str]]:
                 _check_import("numpy", "numpy"),
             ]
         )
-        if settings.uses_deepgram_stt:
+        if settings.uses_realtime:
+            checks.append(_check_import("websockets", "websockets"))
+        elif settings.uses_deepgram_stt:
             checks.append(_check_import("deepgram", "deepgram-sdk"))
-        if settings.uses_xai_stt:
+        elif settings.uses_xai_stt:
             checks.append(_check_import("requests", "requests"))
-    if settings.uses_elevenlabs_tts:
+    if settings.uses_elevenlabs_tts and not settings.uses_realtime:
         checks.append(_check_import("elevenlabs", "elevenlabs"))
-    if settings.uses_xai_tts:
+    if settings.uses_xai_tts and not settings.uses_realtime:
         checks.append(_check_import("requests", "requests"))
     return checks
 

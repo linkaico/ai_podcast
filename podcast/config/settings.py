@@ -61,6 +61,7 @@ class Settings:
     root_dir: Path
     active_llm: str
     active_model: str
+    conversation_mode: str = "dry-run"
     anthropic_api_key: str = ""
     openai_api_key: str = ""
     google_api_key: str = ""
@@ -74,7 +75,7 @@ class Settings:
     stt_mode: str = "deepgram"
     tts_mode: str = "dry-run"
     deepgram_model: str = "nova-3"
-    elevenlabs_model: str = "eleven_multilingual_v3"
+    elevenlabs_model: str = "eleven_flash_v2_5"
     xai_stt_language: str = "en"
     xai_tts_voice: str = "eve"
     xai_tts_language: str = "en"
@@ -90,6 +91,11 @@ class Settings:
     elevenlabs_similarity_boost: float = 0.80
     elevenlabs_style: float = 0.35
     elevenlabs_speed: float = 1.0
+    realtime_model: str = "gpt-realtime"
+    realtime_voice: str = "marin"
+    realtime_transcription_model: str = "gpt-4o-transcribe"
+    realtime_vad_mode: str = "semantic_vad"
+    realtime_sample_rate: int = 24000
 
     @property
     def prompts_dir(self) -> Path:
@@ -143,6 +149,10 @@ class Settings:
     def uses_live_tts(self) -> bool:
         return not self.uses_dry_run_tts
 
+    @property
+    def uses_realtime(self) -> bool:
+        return self.conversation_mode == "realtime"
+
     def validate_for_active_provider(self) -> None:
         required_by_provider = {
             "anthropic": ("ANTHROPIC_API_KEY", self.anthropic_api_key),
@@ -162,6 +172,8 @@ class Settings:
             raise SettingsError(f"{env_name} is required when ACTIVE_LLM={self.active_llm}.")
 
     def validate_audio_modes(self) -> None:
+        if self.conversation_mode not in {"dry-run", "chained", "realtime"}:
+            raise SettingsError("CONVERSATION_MODE must be one of: dry-run, chained, realtime.")
         if self.input_mode not in {"text", "mic"}:
             raise SettingsError("INPUT_MODE must be either 'text' or 'mic'.")
         if self.stt_mode not in {"deepgram", "xai"}:
@@ -180,6 +192,23 @@ class Settings:
             raise SettingsError("PROVIDER_TIMEOUT_SECONDS must be greater than zero.")
         if self.provider_max_retries < 0:
             raise SettingsError("PROVIDER_MAX_RETRIES must be zero or greater.")
+        if self.conversation_mode == "dry-run" and (
+            not self.is_dry_run or not self.uses_text_input or not self.uses_dry_run_tts
+        ):
+            raise SettingsError(
+                "CONVERSATION_MODE=dry-run requires ACTIVE_LLM=dry-run, INPUT_MODE=text, "
+                "and TTS_MODE=dry-run; use CONVERSATION_MODE=chained for live providers."
+            )
+        if self.uses_realtime:
+            if not self.openai_api_key:
+                raise SettingsError("OPENAI_API_KEY is required when CONVERSATION_MODE=realtime.")
+            if not self.uses_microphone_input:
+                raise SettingsError("INPUT_MODE=mic is required when CONVERSATION_MODE=realtime.")
+            if self.realtime_vad_mode not in {"semantic_vad", "server_vad"}:
+                raise SettingsError("REALTIME_VAD_MODE must be either 'semantic_vad' or 'server_vad'.")
+            if self.realtime_sample_rate != 24000:
+                raise SettingsError("REALTIME_SAMPLE_RATE must be 24000 for PCM realtime audio.")
+            return
         if self.uses_microphone_input and self.uses_deepgram_stt and not self.deepgram_api_key:
             raise SettingsError("DEEPGRAM_API_KEY is required when INPUT_MODE=mic.")
         if self.uses_microphone_input and self.uses_xai_stt and not self.xai_api_key:
@@ -193,7 +222,8 @@ class Settings:
             raise SettingsError("XAI_API_KEY is required when TTS_MODE=xai.")
 
     def validate_runtime(self) -> None:
-        self.validate_for_active_provider()
+        if not self.uses_realtime:
+            self.validate_for_active_provider()
         self.validate_audio_modes()
 
     def with_overrides(self, **kwargs) -> "Settings":
@@ -210,6 +240,7 @@ def load_settings(root_dir: str | Path | None = None, validate: bool = True) -> 
         root_dir=root,
         active_llm=_getenv("ACTIVE_LLM", "dry-run").lower(),
         active_model=_getenv("ACTIVE_MODEL", "dry-run-v1"),
+        conversation_mode=_getenv("CONVERSATION_MODE", "dry-run").lower(),
         anthropic_api_key=_getenv("ANTHROPIC_API_KEY"),
         openai_api_key=_getenv("OPENAI_API_KEY"),
         google_api_key=_getenv("GOOGLE_API_KEY"),
@@ -223,7 +254,7 @@ def load_settings(root_dir: str | Path | None = None, validate: bool = True) -> 
         stt_mode=_getenv("STT_MODE", "deepgram").lower(),
         tts_mode=_getenv("TTS_MODE", "dry-run").lower(),
         deepgram_model=_getenv("DEEPGRAM_MODEL", "nova-3"),
-        elevenlabs_model=_getenv("ELEVENLABS_MODEL", "eleven_multilingual_v3"),
+        elevenlabs_model=_getenv("ELEVENLABS_MODEL", "eleven_flash_v2_5"),
         xai_stt_language=_getenv("XAI_STT_LANGUAGE", "en") or "en",
         xai_tts_voice=_getenv("XAI_TTS_VOICE", "eve") or "eve",
         xai_tts_language=_getenv("XAI_TTS_LANGUAGE", "en") or "en",
@@ -239,6 +270,11 @@ def load_settings(root_dir: str | Path | None = None, validate: bool = True) -> 
         elevenlabs_similarity_boost=_getenv_float("ELEVENLABS_SIMILARITY_BOOST", 0.80),
         elevenlabs_style=_getenv_float("ELEVENLABS_STYLE", 0.35),
         elevenlabs_speed=_getenv_float("ELEVENLABS_SPEED", 1.0),
+        realtime_model=_getenv("REALTIME_MODEL", "gpt-realtime"),
+        realtime_voice=_getenv("REALTIME_VOICE", "marin"),
+        realtime_transcription_model=_getenv("REALTIME_TRANSCRIPTION_MODEL", "gpt-4o-transcribe"),
+        realtime_vad_mode=_getenv("REALTIME_VAD_MODE", "semantic_vad").lower(),
+        realtime_sample_rate=_getenv_int("REALTIME_SAMPLE_RATE", 24000),
     )
     if validate:
         settings.validate_runtime()
