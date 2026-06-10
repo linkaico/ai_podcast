@@ -75,6 +75,23 @@ def test_load_settings_defaults_to_dry_run(tmp_path, monkeypatch):
     assert settings.realtime_voice == "marin"
 
 
+def test_blank_env_values_fall_back_to_defaults(tmp_path, monkeypatch):
+    for name in API_ENV:
+        monkeypatch.delenv(name, raising=False)
+    # Empty (but present) env lines must not crash typed parsing; they fall back to defaults.
+    monkeypatch.setenv("ACTIVE_LLM", "")
+    monkeypatch.setenv("AUDIO_SAMPLE_RATE", "")
+    monkeypatch.setenv("PROVIDER_MAX_RETRIES", "")
+    monkeypatch.setenv("CONFIRM_TRANSCRIPT", "")
+
+    settings = load_settings(tmp_path)
+
+    assert settings.active_llm == "dry-run"
+    assert settings.audio_sample_rate == 16000
+    assert settings.provider_max_retries == 1
+    assert settings.confirm_transcript is True
+
+
 def test_real_provider_requires_matching_api_key(tmp_path, monkeypatch):
     for name in API_ENV:
         monkeypatch.delenv(name, raising=False)
@@ -89,6 +106,7 @@ def test_real_provider_accepts_matching_api_key(tmp_path, monkeypatch):
     for name in API_ENV:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("ACTIVE_LLM", "openai")
+    monkeypatch.setenv("ACTIVE_MODEL", "gpt-4o")
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setenv("CONVERSATION_MODE", "chained")
 
@@ -96,6 +114,18 @@ def test_real_provider_accepts_matching_api_key(tmp_path, monkeypatch):
 
     assert settings.active_llm == "openai"
     assert settings.openai_api_key == "test-key"
+
+
+def test_real_provider_rejects_placeholder_model(tmp_path, monkeypatch):
+    for name in API_ENV:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("ACTIVE_LLM", "anthropic")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv("CONVERSATION_MODE", "chained")
+    # ACTIVE_MODEL left at the dry-run-v1 default — must be rejected for a live provider.
+
+    with pytest.raises(SettingsError, match="ACTIVE_MODEL"):
+        load_settings(tmp_path)
 
 
 def test_mic_input_requires_deepgram_key(tmp_path, monkeypatch):
@@ -186,6 +216,7 @@ def test_audio_modes_are_independent_from_llm_provider(tmp_path, monkeypatch):
     for name in API_ENV:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("ACTIVE_LLM", "anthropic")
+    monkeypatch.setenv("ACTIVE_MODEL", "claude-opus-4-8")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     monkeypatch.setenv("CONVERSATION_MODE", "chained")
     monkeypatch.setenv("INPUT_MODE", "text")

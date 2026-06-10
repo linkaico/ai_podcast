@@ -173,3 +173,55 @@ def test_elevenlabs_tts_uses_extension_from_output_format(tmp_path):
 
     output_path = speak_with_client("hello", 5, settings, client_factory=lambda _key: FakeClient())
     assert output_path.suffix == ".pcm"
+
+
+def test_output_device_parsing():
+    from pipeline.tts import _output_device
+
+    assert _output_device("") is None
+    assert _output_device("default") is None
+    assert _output_device("  DEFAULT ") is None
+    assert _output_device("7") == 7
+    assert _output_device("CABLE Input") == "CABLE Input"
+
+
+def test_coerce_audio_bytes_handles_generator_and_raw():
+    from pipeline.tts import _coerce_audio_bytes
+
+    def chunks():
+        yield b"ab"
+        yield b""  # empty chunk skipped
+        yield b"cd"
+
+    assert _coerce_audio_bytes(chunks()) == b"abcd"
+    assert _coerce_audio_bytes(b"raw") == b"raw"
+    assert _coerce_audio_bytes(bytearray(b"ba")) == b"ba"
+
+
+def test_elevenlabs_extension_rejects_unsupported_format():
+    from pipeline.tts import _elevenlabs_extension
+
+    assert _elevenlabs_extension("mp3_22050_32") == "mp3"
+    with pytest.raises(RuntimeError, match="Unsupported"):
+        _elevenlabs_extension("flac_44100")
+
+
+def test_system_play_windows_uses_startfile(tmp_path, monkeypatch):
+    from pipeline import tts
+
+    called: list[str] = []
+    monkeypatch.setattr(tts.sys, "platform", "win32")
+    monkeypatch.setattr(tts.os, "startfile", lambda path: called.append(path), raising=False)
+
+    tts._system_play(tmp_path / "voice.mp3")
+
+    assert called == [str(tmp_path / "voice.mp3")]
+
+
+def test_system_play_unsupported_platform_raises(tmp_path, monkeypatch):
+    from pipeline import tts
+
+    monkeypatch.setattr(tts.sys, "platform", "linux")
+
+    with pytest.raises(RuntimeError, match="file-only"):
+        tts._system_play(tmp_path / "voice.mp3")

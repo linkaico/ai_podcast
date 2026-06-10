@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 
 import pytest
 
-from pipeline.memory import ConversationMemory
+from pipeline.memory import ConversationMemory, _lock_file_handle, _unlock_file_handle
 
 
 def fixed_now():
@@ -113,3 +114,66 @@ def test_sessions_use_distinct_media_directories_and_monotonic_turn_ids(tmp_path
     for expected in range(43):
         assert first.reserve_turn_id() == expected
     assert first.next_turn_index() == 43
+
+
+def test_session_lock_rejects_second_holder(tmp_path):
+    session_file = tmp_path / "pilot_x.json"
+    lock_path = session_file.with_name(session_file.name + ".lock")
+    held = _lock_file_handle(lock_path)  # simulate another process holding the session
+    try:
+        with pytest.raises(RuntimeError, match="already open"):
+            ConversationMemory("pilot", sessions_dir=tmp_path, session_file=session_file, session_id="pilot_x")
+    finally:
+        _unlock_file_handle(held)
+
+
+def test_close_releases_lock_for_reacquire(tmp_path):
+    session_file = tmp_path / "pilot_z.json"
+    first = ConversationMemory("pilot", sessions_dir=tmp_path, session_file=session_file, session_id="pilot_z")
+    first.close()
+    # After close the lock is released, so a fresh handle can acquire it again.
+    second = ConversationMemory("pilot", sessions_dir=tmp_path, session_file=session_file, session_id="pilot_z")
+    second.close()
+
+
+def test_session_serializes_unicode_and_non_serializable_metadata(tmp_path):
+    memory = ConversationMemory("pilot", sessions_dir=tmp_path, now_fn=fixed_now)
+    memory.add("user", "héllo ünïcode 日本語", metadata={"turn_id": 0, "p": tmp_path / "x.wav"})
+
+    text = memory.session_file.read_text(encoding="utf-8")
+    assert "日本語" in text  # ensure_ascii=False keeps it readable
+    data = json.loads(text)
+    assert isinstance(data["history"][0]["metadata"]["p"], str)  # Path coerced via default=str
+
+
+def test_update_turn_metadata_is_noop_when_turn_trimmed(tmp_path):
+    memory = ConversationMemory("pilot", max_turns=1, sessions_dir=tmp_path, now_fn=fixed_now)
+    memory.add("user", "u0", metadata={"turn_id": 0})
+    memory.add("assistant", "a0", metadata={"turn_id": 0})
+    memory.add("user", "u1", metadata={"turn_id": 1})
+    memory.add("assistant", "a1", metadata={"turn_id": 1})  # turn_id=0 now trimmed out
+
+    memory.update_turn_metadata("assistant", 0, status="late")  # must not raise
+
+
+def test_latest_for_episode_uses_mtime_not_filename(tmp_path):
+    older = tmp_path / "pilot_20260419_130000.json"  # lexically LATER
+    newer = tmp_path / "pilot_20260419_120000.json"  # lexically EARLIER
+    older.write_text(json.dumps({"episode": "pilot", "history": [{"role": "user", "content": "old"}]}), encoding="utf-8")
+    newer.write_text(json.dumps({"episode": "pilot", "history": [{"role": "user", "content": "new"}]}), encoding="utf-8")
+    os.utime(older, (1000, 1000))
+    os.utime(newer, (2000, 2000))  # earlier-named file has the later mtime
+
+    latest = ConversationMemory.latest_for_episode("pilot", tmp_path, now_fn=fixed_now)
+
+    assert latest.get() == [{"role": "user", "content": "new"}]
+
+
+def test_orphan_temp_files_are_swept_on_construct(tmp_path):
+    session_file = tmp_path / "pilot_y.json"
+    orphan = tmp_path / f".{session_file.name}.deadbeef.tmp"
+    orphan.write_text("garbage", encoding="utf-8")
+
+    ConversationMemory("pilot", sessions_dir=tmp_path, session_file=session_file, session_id="pilot_y")
+
+    assert not orphan.exists()

@@ -247,11 +247,10 @@ def _try_play_audio(
 
     try:
         if settings.playback_mode == "sdk":
-            if stream_fn is None:
-                from elevenlabs import play
-
-                stream_fn = play
-            stream_fn(audio_bytes)
+            if stream_fn is not None:
+                stream_fn(audio_bytes)
+            else:
+                _play_via_sounddevice(output_path, settings)
         elif settings.playback_mode == "system":
             _system_play(output_path)
         if output_fn:
@@ -261,8 +260,37 @@ def _try_play_audio(
             output_fn(f"[AI voice playback skipped] {exc}")
 
 
+def _play_via_sounddevice(output_path: Path, settings: Settings) -> None:
+    """Decode the saved artifact and play it to OUTPUT_AUDIO_DEVICE (e.g. an OBS virtual cable).
+
+    Uses sounddevice + soundfile so playback needs no ffmpeg and can be routed to a chosen
+    output device, matching how the realtime path routes audio.
+    """
+    import sounddevice as sd
+    import soundfile as sf
+
+    data, sample_rate = sf.read(str(output_path), dtype="float32")
+    sd.play(data, sample_rate, device=_output_device(settings.output_audio_device))
+    sd.wait()
+
+
+def _output_device(value: str) -> int | str | None:
+    stripped = value.strip()
+    if not stripped or stripped.lower() == "default":
+        return None
+    try:
+        return int(stripped)
+    except ValueError:
+        return stripped
+
+
 def _system_play(output_path: Path) -> None:
     if sys.platform == "darwin":
         subprocess.run(["afplay", str(output_path)], check=True)
+    elif sys.platform == "win32":
+        os.startfile(str(output_path))  # opens the OS default media player
     else:
-        raise RuntimeError("system playback is currently only implemented for macOS afplay.")
+        raise RuntimeError(
+            "system playback is only implemented for macOS (afplay) and Windows (os.startfile); "
+            "use PLAYBACK_MODE=sdk or file-only on this platform."
+        )

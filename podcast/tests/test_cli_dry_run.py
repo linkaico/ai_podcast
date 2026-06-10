@@ -219,7 +219,7 @@ def test_run_episode_records_error_event_on_llm_failure(tmp_path, monkeypatch):
     prompts_dir.mkdir(parents=True)
     (prompts_dir / "base_system.txt").write_text("Base persona", encoding="utf-8")
     settings = Settings(root_dir=tmp_path, active_llm="dry-run", active_model="dry-run-v1")
-    inputs = iter(["turn before failure"])
+    inputs = iter(["turn before failure", "q"])  # host turn, then quit at the error prompt
 
     def fail_llm(history, system_prompt, settings):
         raise RuntimeError("model down")
@@ -246,17 +246,61 @@ def test_run_episode_keeps_ai_text_when_tts_fails(tmp_path, monkeypatch):
 
     monkeypatch.setattr("main.call_llm", lambda *_args: "usable ai answer")
     monkeypatch.setattr("main.speak", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("voice down")))
+    inputs = iter(["host turn", "q"])  # host turn, then quit at the TTS error prompt
 
     memory = run_episode(
         "pilot",
         settings=settings,
-        input_fn=lambda _prompt: "host turn",
+        input_fn=lambda _prompt: next(inputs),
         output_fn=lambda _line: None,
         max_turns=1,
     )
 
     assert [turn["content"] for turn in memory.get()] == ["host turn", "usable ai answer"]
     assert memory.get()[-1]["metadata"]["status"] == "tts_failed"
+
+
+def test_run_episode_retries_failed_step_then_succeeds(tmp_path, monkeypatch):
+    prompts_dir = tmp_path / "config" / "prompts"
+    prompts_dir.mkdir(parents=True)
+    (prompts_dir / "base_system.txt").write_text("Base persona", encoding="utf-8")
+    settings = Settings(root_dir=tmp_path, active_llm="dry-run", active_model="dry-run-v1")
+    attempts = {"n": 0}
+
+    def flaky_llm(*_args):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise RuntimeError("blip")
+        return "recovered answer"
+
+    monkeypatch.setattr("main.call_llm", flaky_llm)
+    inputs = iter(["host turn", "", "q"])  # host turn, Enter=retry at the error prompt, then quit
+
+    memory = run_episode(
+        "pilot",
+        settings=settings,
+        input_fn=lambda _prompt: next(inputs),
+        output_fn=lambda _line: None,
+    )
+
+    assert [turn["content"] for turn in memory.get()] == ["host turn", "recovered answer"]
+    assert attempts["n"] == 2
+
+
+def test_main_keyboard_interrupt_returns_130(monkeypatch, capsys):
+    settings = Settings(root_dir=Path("."), active_llm="dry-run", active_model="dry-run-v1")
+    monkeypatch.setattr("main.load_settings", lambda validate=True: settings)
+
+    def boom(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("main.run_episode", boom)
+
+    code = main(["pilot"])
+
+    captured = capsys.readouterr()
+    assert code == 130
+    assert "Interrupted" in captured.err
 
 
 def test_run_episode_uses_exact_session_path(tmp_path):
@@ -288,6 +332,8 @@ def test_main_passes_resume_and_session_flags(monkeypatch):
     def fake_run_episode(episode_name, settings=None, resume=False, session_path=None, max_turns=None, confirm_transcript=None):
         calls.append({"episode": episode_name, "resume": resume, "session_path": session_path})
 
+    settings = Settings(root_dir=Path("."), active_llm="dry-run", active_model="dry-run-v1")
+    monkeypatch.setattr("main.load_settings", lambda validate=True: settings)
     monkeypatch.setattr("main.run_episode", fake_run_episode)
 
     assert main(["pilot", "--resume"]) == 0
@@ -346,6 +392,9 @@ def test_main_invalid_session_path_returns_error(tmp_path, monkeypatch, capsys):
     prompts_dir.mkdir(parents=True)
     (prompts_dir / "base_system.txt").write_text("Base persona", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
+
+    settings = Settings(root_dir=tmp_path, active_llm="dry-run", active_model="dry-run-v1")
+    monkeypatch.setattr("main.load_settings", lambda validate=True: settings)
 
     code = main(["pilot", "--session", "missing.json"])
 

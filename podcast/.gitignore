@@ -1,4 +1,5 @@
 .env
+.venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -7,11 +8,18 @@ __pycache__/
 .DS_Store
 
 sessions/*.json
-audio/input/*
-audio/output/*
+sessions/*.tmp
+sessions/*.lock
 exports/*
 config/prompts/episodes/*.txt
-!audio/input/.gitkeep
-!audio/output/.gitkeep
 !exports/.gitkeep
 !config/prompts/episodes/.gitkeep
+
+# Audio: ignore all recordings incl. session-scoped audio/<id>/..., keep placeholder dirs
+audio/*
+!audio/input
+!audio/output
+audio/input/*
+audio/output/*
+!audio/input/.gitkeep
+!audio/output/.gitkeep

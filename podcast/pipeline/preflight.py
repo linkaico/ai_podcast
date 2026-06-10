@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import importlib.util
+import shutil
 from pathlib import Path
 from typing import Any
 
 from config.settings import Settings, SettingsError
-from pipeline.stt import list_input_devices
+from pipeline.stt import list_input_devices, list_output_devices
 
 
 def run_preflight(settings: Settings) -> dict[str, Any]:
@@ -13,14 +14,17 @@ def run_preflight(settings: Settings) -> dict[str, Any]:
         _check_settings(settings),
         _check_base_prompt(settings),
         _check_writable_dir("sessions", settings.sessions_dir),
-        _check_writable_dir("audio_input", settings.audio_input_dir),
-        _check_writable_dir("audio_output", settings.audio_output_dir),
+        # Recordings write to audio/<session_id>/...; verify the real parent, not the legacy flat dirs.
+        _check_writable_dir("audio", settings.root_dir / "audio"),
         _check_writable_dir("exports", settings.root_dir / "exports"),
+        _check_disk_space(settings),
     ]
 
     checks.extend(_check_provider_sdks(settings))
     if settings.uses_microphone_input:
         checks.append(_check_audio_device(settings))
+    if settings.uses_realtime or settings.playback_mode in {"sdk", "system"}:
+        checks.append(_check_output_device(settings))
 
     return {
         "ok": all(check["status"] != "error" for check in checks),
@@ -97,6 +101,31 @@ def _check_import(module_name: str, package_name: str) -> dict[str, str]:
     if importlib.util.find_spec(module_name) is None:
         return _check(f"sdk:{package_name}", "error", f"install missing package: {package_name}")
     return _check(f"sdk:{package_name}", "ok", "installed")
+
+
+def _check_disk_space(settings: Settings, min_free_mb: int = 500) -> dict[str, str]:
+    try:
+        usage = shutil.disk_usage(settings.root_dir)
+    except OSError as exc:
+        return _check("disk_space", "warn", f"could not determine free space: {exc}")
+    free_mb = usage.free // (1024 * 1024)
+    if free_mb < min_free_mb:
+        return _check("disk_space", "warn", f"low free disk space: {free_mb} MB (< {min_free_mb} MB)")
+    return _check("disk_space", "ok", f"free disk space: {free_mb} MB")
+
+
+def _check_output_device(settings: Settings) -> dict[str, str]:
+    target = settings.output_audio_device
+    if not target or target.lower() == "default":
+        return _check("output_device", "ok", "using default output device")
+    try:
+        devices = list_output_devices()
+    except RuntimeError as exc:
+        return _check("output_device", "warn", str(exc))
+    for device in devices:
+        if str(device.get("index")) == target or str(device.get("name")) == target:
+            return _check("output_device", "ok", f"found output device: {target}")
+    return _check("output_device", "warn", f"output device not found: {target}")
 
 
 def _check_audio_device(settings: Settings) -> dict[str, str]:

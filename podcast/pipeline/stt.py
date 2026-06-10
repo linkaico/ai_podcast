@@ -36,6 +36,27 @@ def list_input_devices() -> list[dict[str, Any]]:
     return result
 
 
+def list_output_devices() -> list[dict[str, Any]]:
+    try:
+        import sounddevice as sd
+    except ImportError as exc:
+        raise RuntimeError("Install sounddevice to list audio output devices.") from exc
+
+    devices = sd.query_devices()
+    result = []
+    for index, device in enumerate(devices):
+        if int(device.get("max_output_channels", 0)) > 0:
+            result.append(
+                {
+                    "index": index,
+                    "name": device.get("name", ""),
+                    "max_output_channels": device.get("max_output_channels", 0),
+                    "default_samplerate": device.get("default_samplerate"),
+                }
+            )
+    return result
+
+
 def record_until_keypress(
     settings: Settings,
     turn_index: int = 0,
@@ -59,11 +80,19 @@ def record_until_keypress(
     recording_dir = Path(output_dir) if output_dir else settings.audio_input_dir
     recording_dir.mkdir(parents=True, exist_ok=True)
     audio_chunks = []
+    max_frames = settings.audio_sample_rate * settings.audio_max_record_seconds
+    capture_state = {"frames": 0, "capped": False}
 
     def callback(indata: Any, frames: int, time_info: Any, status: Any) -> None:
         if status and output_fn:
             output_fn(f"[audio status] {status}")
+        if capture_state["frames"] >= max_frames:
+            if output_fn and not capture_state["capped"]:
+                output_fn(f"[recording capped at {settings.audio_max_record_seconds}s — press ENTER to stop]")
+                capture_state["capped"] = True
+            return
         audio_chunks.append(indata.copy())
+        capture_state["frames"] += len(indata)
 
     if output_fn:
         output_fn("Recording host audio. Press ENTER to stop.")
@@ -226,15 +255,24 @@ def _transcribe_with_deepgram(client: Any, buffer_data: bytes, options: Any, set
             model=settings.deepgram_model,
             language="en",
             smart_format=True,
+            multichannel=settings.audio_channels > 1,
             request_options={"timeout_in_seconds": settings.provider_timeout_seconds},
         )
 
     rest = getattr(listen, "rest", None)
     if rest is not None:
+        if options is None:
+            raise RuntimeError(
+                "Deepgram REST fallback requires options; use listen.v1.media (deepgram-sdk >= 7.1.0)."
+            )
         return rest.v("1").transcribe_file(source, options)
 
     prerecorded = getattr(listen, "prerecorded", None)
     if prerecorded is not None:
+        if options is None:
+            raise RuntimeError(
+                "Deepgram prerecorded fallback requires options; use listen.v1.media (deepgram-sdk >= 7.1.0)."
+            )
         return prerecorded.v("1").transcribe_file(source, options)
 
     raise RuntimeError("Deepgram client does not expose a prerecorded transcription API.")

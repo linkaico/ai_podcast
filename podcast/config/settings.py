@@ -28,7 +28,8 @@ def _load_dotenv(root_dir: Path) -> None:
 
 
 def _getenv(name: str, default: str = "") -> str:
-    return os.getenv(name, default).strip()
+    value = os.getenv(name, "").strip()
+    return value if value else default
 
 
 def _getenv_int(name: str, default: int) -> int:
@@ -69,7 +70,7 @@ class Settings:
     elevenlabs_api_key: str = ""
     elevenlabs_voice_id: str = ""
     xai_api_key: str = ""
-    audio_device_index: str = "0"
+    audio_device_index: str = "default"
     output_audio_device: str = "default"
     input_mode: str = "text"
     stt_mode: str = "deepgram"
@@ -81,9 +82,11 @@ class Settings:
     xai_tts_language: str = "en"
     audio_sample_rate: int = 16000
     audio_channels: int = 1
+    audio_max_record_seconds: int = 600
     confirm_transcript: bool = True
     provider_timeout_seconds: int = 60
     provider_max_retries: int = 1
+    provider_max_output_tokens: int = 2048
     openai_api_mode: str = "responses"
     playback_mode: str = "file-only"
     elevenlabs_output_format: str = "mp3_22050_32"
@@ -171,6 +174,13 @@ class Settings:
         if not value:
             raise SettingsError(f"{env_name} is required when ACTIVE_LLM={self.active_llm}.")
 
+        if not self.active_model or self.active_model.lower().startswith("dry-run"):
+            raise SettingsError(
+                f"ACTIVE_MODEL must be a real {self.active_llm} model id when "
+                f"ACTIVE_LLM={self.active_llm} (got '{self.active_model}'). "
+                f"E.g. anthropic=claude-opus-4-8, openai=gpt-4o, google=gemini-2.0-flash."
+            )
+
     def validate_audio_modes(self) -> None:
         if self.conversation_mode not in {"dry-run", "chained", "realtime"}:
             raise SettingsError("CONVERSATION_MODE must be one of: dry-run, chained, realtime.")
@@ -188,10 +198,14 @@ class Settings:
             raise SettingsError("AUDIO_SAMPLE_RATE must be greater than zero.")
         if self.audio_channels <= 0:
             raise SettingsError("AUDIO_CHANNELS must be greater than zero.")
+        if self.audio_max_record_seconds <= 0:
+            raise SettingsError("AUDIO_MAX_RECORD_SECONDS must be greater than zero.")
         if self.provider_timeout_seconds <= 0:
             raise SettingsError("PROVIDER_TIMEOUT_SECONDS must be greater than zero.")
         if self.provider_max_retries < 0:
             raise SettingsError("PROVIDER_MAX_RETRIES must be zero or greater.")
+        if self.provider_max_output_tokens <= 0:
+            raise SettingsError("PROVIDER_MAX_OUTPUT_TOKENS must be greater than zero.")
         if self.conversation_mode == "dry-run" and (
             not self.is_dry_run or not self.uses_text_input or not self.uses_dry_run_tts
         ):
@@ -248,7 +262,7 @@ def load_settings(root_dir: str | Path | None = None, validate: bool = True) -> 
         elevenlabs_api_key=_getenv("ELEVENLABS_API_KEY"),
         elevenlabs_voice_id=_getenv("ELEVENLABS_VOICE_ID"),
         xai_api_key=_getenv("XAI_API_KEY"),
-        audio_device_index=_getenv("AUDIO_DEVICE_INDEX", "0"),
+        audio_device_index=_getenv("AUDIO_DEVICE_INDEX", "default"),
         output_audio_device=_getenv("OUTPUT_AUDIO_DEVICE", "default"),
         input_mode=_getenv("INPUT_MODE", "text").lower(),
         stt_mode=_getenv("STT_MODE", "deepgram").lower(),
@@ -260,9 +274,11 @@ def load_settings(root_dir: str | Path | None = None, validate: bool = True) -> 
         xai_tts_language=_getenv("XAI_TTS_LANGUAGE", "en") or "en",
         audio_sample_rate=_getenv_int("AUDIO_SAMPLE_RATE", 16000),
         audio_channels=_getenv_int("AUDIO_CHANNELS", 1),
+        audio_max_record_seconds=_getenv_int("AUDIO_MAX_RECORD_SECONDS", 600),
         confirm_transcript=_getenv_bool("CONFIRM_TRANSCRIPT", True),
         provider_timeout_seconds=_getenv_int("PROVIDER_TIMEOUT_SECONDS", 60),
         provider_max_retries=_getenv_int("PROVIDER_MAX_RETRIES", 1),
+        provider_max_output_tokens=_getenv_int("PROVIDER_MAX_OUTPUT_TOKENS", 2048),
         openai_api_mode=_getenv("OPENAI_API_MODE", "responses").lower(),
         playback_mode=_getenv("PLAYBACK_MODE", "file-only").lower(),
         elevenlabs_output_format=_getenv("ELEVENLABS_OUTPUT_FORMAT", "mp3_22050_32"),

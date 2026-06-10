@@ -4,7 +4,7 @@ import json
 import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from config.settings import PROJECT_ROOT, load_settings
 from main import run_episode as _run_episode
@@ -17,12 +17,24 @@ def run_episode(
     resume: bool = False,
     session_path: str | Path | None = None,
     max_turns: int | None = None,
+    input_fn: Callable[[str], str] | None = None,
+    output_fn: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
-    """Run an episode and return machine-readable session metadata."""
+    """Run an episode and return machine-readable session metadata.
+
+    Pass `input_fn`/`output_fn` to drive the chained loop non-interactively (e.g. from an
+    agent); omit them to use the console. Realtime mode is microphone-driven and cannot be
+    fully driven via `input_fn`.
+    """
     settings = load_settings()
+    driver: dict[str, Any] = {}
+    if input_fn is not None:
+        driver["input_fn"] = input_fn
+    if output_fn is not None:
+        driver["output_fn"] = output_fn
     if settings.uses_realtime:
         memory = asyncio.run(
-            _run_realtime_episode(name, settings, resume=resume, session_path=session_path)
+            _run_realtime_episode(name, settings, resume=resume, session_path=session_path, **driver)
         )
     else:
         memory = _run_episode(
@@ -31,6 +43,7 @@ def run_episode(
             resume=resume,
             session_path=session_path,
             max_turns=max_turns,
+            **driver,
         )
     return _session_metadata(memory.session_file)
 
@@ -126,9 +139,11 @@ def export_transcript(
     if format != "markdown":
         raise ValueError("Only markdown transcript export is currently supported.")
 
+    path = _resolve_session_path(session_path, root_dir)  # resolves + containment-checks once
+    if not path.exists():
+        raise FileNotFoundError(f"Session file does not exist: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
     root = _resolve_root(root_dir)
-    path = _resolve_session_path(session_path, root)
-    payload = load_session(path)
     episode = safe_episode_name(payload.get("episode", "default"))
     exports_dir = root / "exports"
     exports_dir.mkdir(parents=True, exist_ok=True)
@@ -163,11 +178,13 @@ def _resolve_root(root_dir: str | Path | None) -> Path:
 
 
 def _resolve_session_path(session_path: str | Path, root_dir: str | Path | None = None) -> Path:
-    path = Path(session_path)
-    if path.is_absolute():
-        return path
     root = _resolve_root(root_dir)
-    return root / path
+    sessions_dir = (root / "sessions").resolve()
+    candidate = Path(session_path)
+    resolved = (candidate if candidate.is_absolute() else root / candidate).resolve()
+    if not resolved.is_relative_to(sessions_dir):
+        raise ValueError(f"Session path escapes the sessions directory: {session_path}")
+    return resolved
 
 
 def _session_metadata(path: Path | None) -> dict[str, Any]:

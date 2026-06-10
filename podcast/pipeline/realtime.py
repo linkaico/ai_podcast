@@ -14,6 +14,15 @@ from config.settings import Settings
 from pipeline.llm import load_system_prompt
 from pipeline.memory import ConversationMemory
 
+try:  # websockets is required only for realtime; keep the import soft so the module loads without it.
+    from websockets.exceptions import ConnectionClosed, WebSocketException
+except ImportError:  # pragma: no cover - exercised only when websockets is absent
+    class WebSocketException(Exception):
+        """Fallback used when the websockets package is not installed."""
+
+    class ConnectionClosed(WebSocketException):
+        """Fallback used when the websockets package is not installed."""
+
 
 REALTIME_URL = "wss://api.openai.com/v1/realtime"
 
@@ -50,11 +59,13 @@ class RealtimeEventProcessor:
         self,
         memory: ConversationMemory,
         output_stream: Any,
+        playback_queue: "asyncio.Queue[bytes]",
         ai_writer: Any,
         output_fn: Callable[[str], None],
     ) -> None:
         self.memory = memory
         self.output_stream = output_stream
+        self.playback_queue = playback_queue
         self.ai_writer = ai_writer
         self.output_fn = output_fn
         self.turn_by_item_id: dict[str, int] = {}
@@ -91,7 +102,7 @@ class RealtimeEventProcessor:
             audio = base64.b64decode(event.get("delta", ""))
             if audio:
                 self.ai_writer.buffer_write(audio, dtype="int16")
-                self.output_stream.write(audio)
+                self._enqueue_playback(audio)
             return
 
         if event_type == "conversation.item.input_audio_transcription.completed":
@@ -156,7 +167,16 @@ class RealtimeEventProcessor:
             self.memory.add_event("realtime", "failed", details={"error": message})
             raise RuntimeError(f"Realtime API error: {message}")
 
+    def _enqueue_playback(self, audio: bytes) -> None:
+        with suppress(asyncio.QueueFull):
+            self.playback_queue.put_nowait(audio)
+
     def _flush_playback(self) -> None:
+        while True:
+            try:
+                self.playback_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
         with suppress(Exception):
             self.output_stream.abort()
             self.output_stream.start()
@@ -208,13 +228,15 @@ async def run_realtime_episode(
     connector = websocket_connect or _default_websocket_connect
     headers = {"Authorization": f"Bearer {settings.openai_api_key}"}
     microphone_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=256)
+    playback_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=256)
+    mic_stats = {"dropped": 0}
     loop = asyncio.get_running_loop()
 
     def input_callback(indata: Any, _frames: int, _time: Any, status: Any) -> None:
         if status:
             loop.call_soon_threadsafe(output_fn, f"[audio status] {status}")
         payload = bytes(indata)
-        loop.call_soon_threadsafe(_enqueue_audio, microphone_queue, payload)
+        loop.call_soon_threadsafe(_enqueue_audio, microphone_queue, payload, mic_stats, output_fn)
 
     input_device = _audio_device(settings.audio_device_index)
     output_device = _audio_device(settings.output_audio_device)
@@ -237,31 +259,35 @@ async def run_realtime_episode(
     output_fn(f"Session: {memory.session_file}")
     output_fn("Realtime microphone conversation active. Press ENTER to end the episode.")
 
+    model_url = f"{REALTIME_URL}?model={settings.realtime_model}"
     try:
         with sf.SoundFile(host_temp, mode="w", samplerate=settings.realtime_sample_rate, channels=1, subtype="PCM_16") as host_writer:
             with sf.SoundFile(ai_temp, mode="w", samplerate=settings.realtime_sample_rate, channels=1, subtype="PCM_16") as ai_writer:
-                async with connector(REALTIME_URL, headers) as websocket:
-                    await websocket.send(json.dumps(build_session_update(settings, prompt)))
-                    processor = RealtimeEventProcessor(memory, output_stream, ai_writer, output_fn)
-                    input_stream.start()
-                    output_stream.start()
-                    sender = asyncio.create_task(_send_microphone_audio(websocket, microphone_queue, host_writer))
-                    receiver = asyncio.create_task(_receive_events(websocket, processor))
-                    stopper = asyncio.create_task(_wait_for_stop(input_fn))
-                    done, _pending = await asyncio.wait({receiver, stopper}, return_when=asyncio.FIRST_COMPLETED)
-                    if receiver in done:
-                        await receiver
-                    else:
-                        await websocket.send(json.dumps({"type": "input_audio_buffer.commit"}))
-                    sender.cancel()
-                    receiver.cancel()
-                    stopper.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await sender
-                    with suppress(asyncio.CancelledError):
-                        await receiver
-                    with suppress(asyncio.CancelledError):
-                        await stopper
+                try:
+                    async with connector(model_url, headers) as websocket:
+                        await websocket.send(json.dumps(build_session_update(settings, prompt)))
+                        processor = RealtimeEventProcessor(memory, output_stream, playback_queue, ai_writer, output_fn)
+                        input_stream.start()
+                        output_stream.start()
+                        sender = asyncio.create_task(_send_microphone_audio(websocket, microphone_queue, host_writer))
+                        receiver = asyncio.create_task(_receive_events(websocket, processor))
+                        stopper = asyncio.create_task(_wait_for_stop(input_fn))
+                        player = asyncio.create_task(_play_audio(output_stream, playback_queue))
+                        tasks = (sender, receiver, stopper, player)
+                        # In VAD modes the server auto-commits the input buffer on speech end, so we do
+                        # NOT send input_audio_buffer.commit on stop. Just cancel the tasks cleanly.
+                        done, _pending = await asyncio.wait({receiver, stopper}, return_when=asyncio.FIRST_COMPLETED)
+                        try:
+                            if receiver in done:
+                                await receiver
+                        finally:
+                            for task in tasks:
+                                task.cancel()
+                            for task in tasks:
+                                with suppress(asyncio.CancelledError):
+                                    await task
+                except (WebSocketException, OSError) as exc:
+                    raise RuntimeError(f"realtime connection failed (check OPENAI_API_KEY): {exc}") from exc
     finally:
         with suppress(Exception):
             input_stream.stop()
@@ -272,24 +298,41 @@ async def run_realtime_episode(
         _publish_wav(host_temp, host_path, memory, "input_wav")
         _publish_wav(ai_temp, ai_path, memory, "output_wav")
         memory.add_event("realtime", "ended")
+        memory.close()
     return memory
 
 
 async def _send_microphone_audio(websocket: Any, queue: asyncio.Queue[bytes], writer: Any) -> None:
-    while True:
-        audio = await queue.get()
-        writer.buffer_write(audio, dtype="int16")
-        await websocket.send(
-            json.dumps({"type": "input_audio_buffer.append", "audio": base64.b64encode(audio).decode("ascii")})
-        )
+    try:
+        while True:
+            audio = await queue.get()
+            writer.buffer_write(audio, dtype="int16")
+            await websocket.send(
+                json.dumps({"type": "input_audio_buffer.append", "audio": base64.b64encode(audio).decode("ascii")})
+            )
+    except ConnectionClosed:
+        return
 
 
 async def _receive_events(websocket: Any, processor: RealtimeEventProcessor) -> None:
-    async for raw_event in websocket:
-        await processor.handle(json.loads(raw_event), websocket)
+    try:
+        async for raw_event in websocket:
+            await processor.handle(json.loads(raw_event), websocket)
+    except ConnectionClosed as exc:
+        processor.memory.add_event("realtime", "disconnected", details={"reason": str(exc)})
+        processor.output_fn("[realtime] connection closed; ending session.")
+
+
+async def _play_audio(output_stream: Any, queue: asyncio.Queue[bytes]) -> None:
+    while True:
+        audio = await queue.get()
+        await asyncio.to_thread(output_stream.write, audio)
 
 
 async def _wait_for_stop(input_fn: Callable[[str], str]) -> None:
+    # NOTE: On Windows, loop.add_reader(sys.stdin, ...) is not implemented, so we fall back to a
+    # blocking asyncio.to_thread(input) below. That thread is not cancellable, so it can linger
+    # until the user presses ENTER (or the process exits) even after the session has ended.
     if input_fn is not input:
         await asyncio.to_thread(input_fn, "")
         return
@@ -353,7 +396,15 @@ def _audio_device(value: str) -> int | str | None:
         return stripped
 
 
-def _enqueue_audio(queue: asyncio.Queue[bytes], payload: bytes) -> None:
+def _enqueue_audio(
+    queue: asyncio.Queue[bytes],
+    payload: bytes,
+    stats: dict[str, int],
+    output_fn: Callable[[str], None],
+) -> None:
     if queue.full():
+        stats["dropped"] += 1
+        if stats["dropped"] % 50 == 1:
+            output_fn(f"[mic] dropping audio frames ({stats['dropped']} so far) — system busy")
         return
     queue.put_nowait(payload)

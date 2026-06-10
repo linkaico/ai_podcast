@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+from contextlib import suppress
 from pathlib import Path
 from typing import Callable
 
@@ -17,6 +18,23 @@ from pipeline.tts import speak
 
 
 EXIT_COMMANDS = {"q", "quit", "end"}
+
+
+def _run_step(fn, stage, turn_id, memory, input_fn, output_fn):
+    """Run one turn step; on error let the operator retry/skip/quit.
+
+    Returns (status, result) where status is "ok" | "skip" | "quit".
+    """
+    while True:
+        try:
+            return "ok", fn()
+        except Exception as exc:
+            memory.add_event(stage, "failed", turn_id, structured_error(exc, stage))
+            output_fn(f"{stage} failed: {exc}")
+            choice = input_fn("[Enter=retry] s=skip / q=quit > ").strip().lower()
+            if choice in ("", "r"):
+                continue
+            return ("quit" if choice == "q" else "skip"), None
 
 
 def run_episode(
@@ -57,60 +75,100 @@ def run_episode(
     else:
         output_fn("Microphone input mode is active. Press ENTER after each recording.")
 
-    while True:
-        if max_turns is not None and completed_turns >= max_turns:
-            output_fn("Max turns reached. Session saved.")
-            break
+    try:
+        while True:
+            if max_turns is not None and completed_turns >= max_turns:
+                output_fn("Max turns reached. Session saved.")
+                break
 
-        turn_id = memory.reserve_turn_id()
-        try:
-            host_text, user_metadata = _capture_host_turn(
-                active_settings,
+            # Mic recordings need the turn id up front (filename); text turns reserve lazily (INF-13).
+            turn_id = memory.reserve_turn_id() if active_settings.uses_microphone_input else None
+
+            status, captured = _run_step(
+                lambda: _capture_host_turn(
+                    active_settings,
+                    turn_id if turn_id is not None else 0,
+                    input_fn,
+                    output_fn,
+                    memory,
+                ),
+                "host_turn",
                 turn_id,
+                memory,
                 input_fn,
                 output_fn,
-                memory,
             )
-        except Exception as exc:
-            memory.add_event("host_turn", "failed", turn_id, structured_error(exc, "host_turn"))
-            output_fn(f"Host turn failed: {exc}")
-            break
+            if status == "quit":
+                output_fn("Episode ended. Session saved.")
+                memory.add_event("episode", "ended", turn_id)
+                break
+            if status == "skip":
+                output_fn("Turn skipped.")
+                memory.add_event("turn", "skipped", turn_id)
+                continue
+            host_text, user_metadata = captured
 
-        if host_text is None:
-            output_fn("Turn skipped.")
-            memory.add_event("turn", "skipped", turn_id)
-            continue
-        if host_text.lower() in EXIT_COMMANDS:
-            output_fn("Episode ended. Session saved.")
-            memory.add_event("episode", "ended", turn_id)
-            break
-        if not host_text:
-            output_fn("Empty turn skipped.")
-            memory.add_event("turn", "skipped_empty", turn_id)
-            continue
+            if host_text is None:
+                output_fn("Turn skipped.")
+                memory.add_event("turn", "skipped", turn_id)
+                continue
+            if host_text.lower() in EXIT_COMMANDS:
+                output_fn("Episode ended. Session saved.")
+                memory.add_event("episode", "ended", turn_id)
+                break
+            if not host_text:
+                output_fn("Empty turn skipped.")
+                memory.add_event("turn", "skipped_empty", turn_id)
+                continue
 
-        output_fn(f"FLORIAN: {host_text}")
-        memory.add("user", host_text, metadata={**(user_metadata or {}), "turn_id": turn_id})
+            if turn_id is None:  # text mode: commit an id now that the turn is real
+                turn_id = memory.reserve_turn_id()
 
-        try:
+            output_fn(f"FLORIAN: {host_text}")
+            memory.add("user", host_text, metadata={**(user_metadata or {}), "turn_id": turn_id})
+
             output_fn("AI thinking...")
-            ai_response = call_llm(memory.get(), system_prompt, active_settings)
+            status, ai_response = _run_step(
+                lambda: call_llm(memory.get(), system_prompt, active_settings),
+                "llm_completed",
+                turn_id,
+                memory,
+                input_fn,
+                output_fn,
+            )
+            if status == "quit":
+                output_fn("Episode ended. Session saved.")
+                memory.add_event("episode", "ended", turn_id)
+                break
+            if status == "skip":
+                output_fn("Turn skipped.")
+                continue
             memory.add_event("llm_completed", "ok", turn_id)
             output_fn(f"AI: {ai_response}")
             memory.add("assistant", ai_response, metadata={"status": "tts_pending", "turn_id": turn_id})
-        except Exception as exc:
-            memory.add_event("llm_completed", "failed", turn_id, structured_error(exc, "llm_completed"))
-            output_fn(f"AI response failed: {exc}")
-            break
 
-        try:
-            ai_audio_path = speak(
-                ai_response,
+            status, ai_audio_path = _run_step(
+                lambda: speak(
+                    ai_response,
+                    turn_id,
+                    active_settings,
+                    output_fn=output_fn,
+                    output_dir=memory.audio_output_dir,
+                ),
+                "tts_saved",
                 turn_id,
-                active_settings,
-                output_fn=output_fn,
-                output_dir=memory.audio_output_dir,
+                memory,
+                input_fn,
+                output_fn,
             )
+            if status in ("quit", "skip"):
+                memory.update_turn_metadata("assistant", turn_id, status="tts_failed")
+                if status == "quit":
+                    output_fn("Episode ended. Session saved.")
+                    memory.add_event("episode", "ended", turn_id)
+                    break
+                continue
+
             assistant_metadata = {"status": "tts_saved"}
             if ai_audio_path:
                 assistant_metadata["audio_path"] = str(ai_audio_path)
@@ -118,14 +176,12 @@ def run_episode(
             memory.add_event("tts_saved", "ok", turn_id, {"audio_path": str(ai_audio_path) if ai_audio_path else ""})
             if ai_audio_path and active_settings.uses_live_tts:
                 output_fn(f"AI audio saved: {ai_audio_path}")
-        except Exception as exc:
-            memory.update_turn_metadata("assistant", turn_id, status="tts_failed")
-            memory.add_event("tts_saved", "failed", turn_id, structured_error(exc, "tts_saved"))
-            output_fn(f"AI voice failed: {exc}")
-            break
 
-        memory.add_event("turn", "complete", turn_id)
-        completed_turns += 1
+            memory.add_event("turn", "complete", turn_id)
+            memory.flush()
+            completed_turns += 1
+    finally:
+        memory.close()
 
     return memory
 
@@ -180,6 +236,9 @@ def _capture_host_turn(
 
 
 def main(argv: list[str] | None = None) -> int:
+    if sys.platform == "win32":  # so non-ASCII device names in --list-devices aren't mojibake
+        with suppress(Exception):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description="Run an AI podcast episode.")
     parser.add_argument("episode_name", nargs="?", default="default")
     parser.add_argument("--resume", action="store_true", help="Resume the latest session for this episode.")
@@ -213,6 +272,15 @@ def main(argv: list[str] | None = None) -> int:
             confirm_override = False
 
         if settings.uses_realtime:
+            # --max-turns and --confirm-transcript do not apply to realtime: turns are not
+            # discrete and transcripts are produced live by the model. Reject the turn cap
+            # explicitly rather than silently ignoring it; stop a realtime episode with ENTER.
+            if args.max_turns is not None:
+                print(
+                    "Error: --max-turns is not supported in realtime mode (press ENTER to stop).",
+                    file=sys.stderr,
+                )
+                return 1
             asyncio.run(
                 run_realtime_episode(
                     args.episode_name,
@@ -230,6 +298,9 @@ def main(argv: list[str] | None = None) -> int:
                 max_turns=args.max_turns,
                 confirm_transcript=confirm_override,
             )
+    except KeyboardInterrupt:
+        print("\nInterrupted — session saved.", file=sys.stderr)
+        return 130
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1

@@ -1,11 +1,36 @@
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, TypeVar
 
 
 T = TypeVar("T")
+
+
+def _run_with_deadline(operation: Callable[[], T], timeout_seconds: int) -> T:
+    """Run `operation` under a wall-clock deadline using a daemon thread.
+
+    A daemon thread can't block interpreter exit, so a genuinely hung call is
+    abandoned (it dies with the process / when its own socket timeout fires).
+    """
+    box: dict[str, Any] = {}
+
+    def runner() -> None:
+        try:
+            box["value"] = operation()
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread below
+            box["error"] = exc
+
+    thread = threading.Thread(target=runner, daemon=True)
+    thread.start()
+    thread.join(timeout_seconds)
+    if thread.is_alive():
+        raise TimeoutError(f"operation exceeded {timeout_seconds}s")
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
 
 
 @dataclass
@@ -42,20 +67,19 @@ def retry_call(
     sleep_fn: Callable[[float], None] = time.sleep,
     backoff_seconds: float = 0.5,
 ) -> T:
-    """Run a provider operation with a small retry budget.
+    """Run a provider operation with a small retry budget and a wall-clock deadline.
 
-    The sync SDKs used here do not expose one common timeout interface, so
-    timeout_seconds is passed to clients where supported and preserved for
-    diagnostics here.
+    Each attempt runs under `timeout_seconds`; a timeout is treated as a transient
+    error (see `is_transient_provider_error`) and retried within the budget. This is
+    a backstop on top of the per-SDK socket timeouts.
     """
-    del timeout_seconds
     exceptions = tuple(retry_exceptions)
     attempts = max_retries + 1
     last_error: BaseException | None = None
 
     for attempt in range(1, attempts + 1):
         try:
-            return operation()
+            return _run_with_deadline(operation, timeout_seconds)
         except exceptions as exc:
             last_error = exc
             if attempt >= attempts or (retry_predicate is not None and not retry_predicate(exc)):
@@ -66,7 +90,7 @@ def retry_call(
         provider=provider,
         stage=stage,
         attempts=attempts,
-        original_error=str(last_error) if last_error else "unknown error",
+        original_error=(f"{type(last_error).__name__}: {last_error}" if last_error else "unknown error"),
     )
 
 

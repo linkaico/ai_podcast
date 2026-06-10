@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,6 +15,49 @@ from config.settings import PROJECT_ROOT
 
 
 Turn = dict[str, Any]
+
+logger = logging.getLogger(__name__)
+
+# Session files locked by THIS process. A re-open of the same session in the same
+# process (e.g. resume) is re-entrant; a different process is rejected.
+_PROCESS_LOCKS: dict[str, Any] = {}
+
+
+def _lock_file_handle(lock_path: Path) -> Any:
+    """Open and non-blockingly lock a sidecar file; raise OSError if already locked."""
+    handle = open(lock_path, "a+")
+    try:
+        if os.fstat(handle.fileno()).st_size == 0:
+            handle.write("lock")
+            handle.flush()
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        raise
+    return handle
+
+
+def _unlock_file_handle(handle: Any) -> None:
+    with suppress(Exception):
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    with suppress(Exception):
+        handle.close()
 
 
 def _utc_now() -> datetime:
@@ -39,9 +84,12 @@ class ConversationMemory:
     artifact_manifest: dict[str, list[str]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        self._lock_ok = False
+        self._lock_handle: Any = None
+        self._lock_key: str | None = None
         self.episode_name = _safe_episode_name(self.episode_name)
-        self.sessions_dir = self.sessions_dir or PROJECT_ROOT / "sessions"
-        self.root_dir = self.root_dir or _infer_root_dir(self.sessions_dir)
+        self.sessions_dir = Path(self.sessions_dir) if self.sessions_dir else PROJECT_ROOT / "sessions"
+        self.root_dir = Path(self.root_dir) if self.root_dir else _infer_root_dir(self.sessions_dir)
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
         if self.session_id is None:
             timestamp = self.now_fn().strftime("%Y%m%d_%H%M%S_%f")
@@ -51,6 +99,8 @@ class ConversationMemory:
         else:
             self.session_file = Path(self.session_file)
         self.artifact_manifest = _normalize_artifact_manifest(self.artifact_manifest)
+        self._sweep_orphan_temps()
+        self._acquire_lock()
 
     @property
     def audio_input_dir(self) -> Path:
@@ -83,13 +133,21 @@ class ConversationMemory:
         if not isinstance(events, list):
             events = []
 
+        stored_session_id = payload.get("session_id")
+        if not stored_session_id:
+            logger.warning(
+                "Session file %s has no session_id; deriving audio paths from filename '%s'.",
+                session_path.name,
+                session_path.stem,
+            )
+
         return cls(
             episode_name=episode_name,
             max_turns=max_turns,
             sessions_dir=session_path.parent,
             session_file=session_path,
             root_dir=_infer_root_dir(session_path.parent),
-            session_id=payload.get("session_id") or session_path.stem,
+            session_id=stored_session_id or session_path.stem,
             next_turn_id_value=_next_turn_id_from_payload(payload),
             now_fn=now_fn,
             history=history,
@@ -107,7 +165,10 @@ class ConversationMemory:
     ) -> "ConversationMemory":
         safe_name = _safe_episode_name(episode_name)
         session_root = Path(sessions_dir)
-        matches = sorted(session_root.glob(f"{safe_name}_*.json"))
+        matches = sorted(
+            session_root.glob(f"{safe_name}_*.json"),
+            key=lambda candidate: candidate.stat().st_mtime,
+        )
         if not matches:
             raise FileNotFoundError(f"No sessions found for episode '{safe_name}' in {session_root}.")
         return cls.from_session_file(matches[-1], max_turns=max_turns, now_fn=now_fn)
@@ -142,7 +203,6 @@ class ConversationMemory:
     def reserve_turn_id(self) -> int:
         turn_id = self.next_turn_id_value
         self.next_turn_id_value += 1
-        self._save()
         return turn_id
 
     def update_turn_metadata(self, role: str, turn_id: int, **metadata: Any) -> None:
@@ -152,9 +212,9 @@ class ConversationMemory:
                 existing.update(metadata)
                 turn["metadata"] = existing
                 self._register_paths(existing)
-                self._save()
                 return
-        raise ValueError(f"No {role} turn found for turn_id={turn_id}.")
+        # The turn aged out of the kept window (_trim); nothing to update.
+        logger.debug("No %s turn for turn_id=%s (likely trimmed); skipping metadata update.", role, turn_id)
 
     def order_realtime_transcripts(self) -> None:
         positions = [
@@ -168,8 +228,6 @@ class ConversationMemory:
         )
         for index, turn in zip(positions, ordered):
             self.history[index] = turn
-        if positions:
-            self._save()
 
     def add_event(
         self,
@@ -189,7 +247,6 @@ class ConversationMemory:
             event["details"] = details
             self._register_paths(details)
         self.events.append(event)
-        self._save()
 
     def _trim(self) -> None:
         max_messages = self.max_turns * 2
@@ -208,7 +265,9 @@ class ConversationMemory:
             "artifacts": self.artifacts(),
         }
         temporary_path = self.session_file.with_name(f".{self.session_file.name}.{uuid4().hex}.tmp")
-        temporary_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        temporary_path.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8"
+        )
         os.replace(temporary_path, self.session_file)
 
     def artifacts(self) -> dict[str, list[str]]:
@@ -229,6 +288,62 @@ class ConversationMemory:
             if not isinstance(value, str) or "path" not in key:
                 continue
             self.register_artifact(value)
+
+    def flush(self) -> None:
+        """Persist the full session snapshot (call on turn boundaries / before close)."""
+        if self._lock_ok:
+            self._save()
+
+    def close(self) -> None:
+        """Flush the final snapshot and release the session lock."""
+        self.flush()
+        self._release_lock()
+
+    def __enter__(self) -> "ConversationMemory":
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        # Release the lock only (no write) so a stale instance can't clobber newer data.
+        with suppress(Exception):
+            self._release_lock()
+
+    def _sweep_orphan_temps(self) -> None:
+        with suppress(Exception):
+            for tmp in self.sessions_dir.glob(f".{self.session_file.name}.*.tmp"):
+                tmp.unlink(missing_ok=True)
+
+    def _acquire_lock(self) -> None:
+        key = str(self.session_file.resolve())
+        if key in _PROCESS_LOCKS:
+            # Same process already holds this session (re-entrant resume).
+            self._lock_ok = True
+            self._lock_key = None
+            return
+        lock_path = self.session_file.with_name(self.session_file.name + ".lock")
+        try:
+            handle = _lock_file_handle(lock_path)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Session is already open in another process: {self.session_file.name}"
+            ) from exc
+        _PROCESS_LOCKS[key] = handle
+        self._lock_handle = handle
+        self._lock_key = key
+        self._lock_ok = True
+
+    def _release_lock(self) -> None:
+        key = getattr(self, "_lock_key", None)
+        if key and key in _PROCESS_LOCKS:
+            handle = _PROCESS_LOCKS.pop(key)
+            _unlock_file_handle(handle)
+            with suppress(Exception):
+                Path(handle.name).unlink()
+        self._lock_ok = False
+        self._lock_handle = None
+        self._lock_key = None
 
 
 def safe_episode_name(name: str) -> str:

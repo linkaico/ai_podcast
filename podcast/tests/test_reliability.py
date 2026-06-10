@@ -61,3 +61,24 @@ def test_retry_call_does_not_retry_non_transient_failure():
         )
 
     assert calls["count"] == 1
+
+
+def test_retry_call_enforces_wall_clock_deadline():
+    import time as _time
+
+    def slow_operation():
+        _time.sleep(0.5)  # exceeds the 0s deadline; runs to completion in a daemon thread
+        return "too late"
+
+    with pytest.raises(ProviderCallError) as exc:
+        retry_call(
+            slow_operation,
+            provider="provider",
+            stage="stage",
+            max_retries=0,
+            timeout_seconds=0,
+            sleep_fn=lambda _seconds: None,
+        )
+
+    assert exc.value.attempts == 1
+    assert "exceeded" in str(exc.value).lower()

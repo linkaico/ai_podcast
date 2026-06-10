@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import types
+
 from config.settings import Settings
 from pipeline.preflight import format_preflight_report, run_preflight
 
@@ -179,3 +181,57 @@ def test_preflight_realtime_requires_websocket_not_deepgram(tmp_path, monkeypatc
     assert result["ok"] is True
     assert any(check["name"] == "sdk:websockets" for check in result["checks"])
     assert not any(check["name"] == "sdk:deepgram-sdk" for check in result["checks"])
+
+
+def test_preflight_checks_real_audio_root_and_disk_space(tmp_path):
+    prompts_dir = tmp_path / "config" / "prompts"
+    prompts_dir.mkdir(parents=True)
+    (prompts_dir / "base_system.txt").write_text("Base persona", encoding="utf-8")
+    settings = Settings(root_dir=tmp_path, active_llm="dry-run", active_model="dry-run-v1")
+
+    result = run_preflight(settings)
+    names = {check["name"] for check in result["checks"]}
+
+    assert "audio" in names  # the real recording parent, not the legacy flat dirs
+    assert "audio_input" not in names and "audio_output" not in names
+    assert "disk_space" in names
+    assert result["ok"] is True
+
+
+def test_preflight_warns_on_low_disk_space(tmp_path, monkeypatch):
+    prompts_dir = tmp_path / "config" / "prompts"
+    prompts_dir.mkdir(parents=True)
+    (prompts_dir / "base_system.txt").write_text("Base persona", encoding="utf-8")
+    settings = Settings(root_dir=tmp_path, active_llm="dry-run", active_model="dry-run-v1")
+
+    monkeypatch.setattr(
+        "pipeline.preflight.shutil.disk_usage",
+        lambda _path: types.SimpleNamespace(total=10 * 1024 * 1024, used=9 * 1024 * 1024, free=1 * 1024 * 1024),
+    )
+
+    result = run_preflight(settings)
+    disk = next(check for check in result["checks"] if check["name"] == "disk_space")
+
+    assert disk["status"] == "warn"
+    assert result["ok"] is True  # warn is non-fatal
+
+
+def test_preflight_warns_on_missing_output_device(tmp_path, monkeypatch):
+    prompts_dir = tmp_path / "config" / "prompts"
+    prompts_dir.mkdir(parents=True)
+    (prompts_dir / "base_system.txt").write_text("Base persona", encoding="utf-8")
+    settings = Settings(
+        root_dir=tmp_path,
+        active_llm="dry-run",
+        active_model="dry-run-v1",
+        playback_mode="sdk",
+        output_audio_device="CABLE Out",
+    )
+
+    monkeypatch.setattr("pipeline.preflight.list_output_devices", lambda: [{"index": 0, "name": "Speakers"}])
+
+    result = run_preflight(settings)
+    output_device = next(check for check in result["checks"] if check["name"] == "output_device")
+
+    assert output_device["status"] == "warn"
+    assert result["ok"] is True  # warn is non-fatal

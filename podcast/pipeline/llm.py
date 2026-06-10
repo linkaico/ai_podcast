@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from config.settings import PROJECT_ROOT, Settings, load_settings
+from pipeline.memory import safe_episode_name
 from pipeline.reliability import is_transient_provider_error, retry_call
+
+logger = logging.getLogger(__name__)
 
 
 def load_system_prompt(
@@ -22,7 +26,7 @@ def load_system_prompt(
     prompt_parts = [base_path.read_text(encoding="utf-8").strip()]
 
     if episode_name:
-        episode_path = prompts_dir / "episodes" / f"{episode_name}.txt"
+        episode_path = prompts_dir / "episodes" / f"{safe_episode_name(episode_name)}.txt"
         if episode_path.exists():
             prompt_parts.append(episode_path.read_text(encoding="utf-8").strip())
 
@@ -100,16 +104,26 @@ def _call_anthropic(
         raise RuntimeError("Install anthropic to use ACTIVE_LLM=anthropic.") from exc
 
     factory = client_factory or anthropic.Anthropic
-    client = factory(api_key=settings.anthropic_api_key, timeout=settings.provider_timeout_seconds)
+    client = factory(
+        api_key=settings.anthropic_api_key,
+        timeout=settings.provider_timeout_seconds,
+        max_retries=0,
+    )
     response = client.messages.create(
         model=settings.active_model,
-        max_tokens=1024,
-        system=system_prompt,
+        max_tokens=settings.provider_max_output_tokens,
+        system=[{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
         messages=messages,
     )
-    return "\n".join(
+    stop_reason = getattr(response, "stop_reason", None)
+    if stop_reason == "refusal":
+        raise RuntimeError("anthropic declined to respond (stop_reason=refusal).")
+    text = "\n".join(
         block.text for block in response.content if getattr(block, "type", None) == "text"
     ).strip()
+    if stop_reason == "max_tokens":
+        logger.warning("anthropic response truncated at max_tokens=%s.", settings.provider_max_output_tokens)
+    return text
 
 
 def _call_openai(
@@ -124,21 +138,28 @@ def _call_openai(
         raise RuntimeError("Install openai to use ACTIVE_LLM=openai.") from exc
 
     factory = client_factory or OpenAI
-    client = factory(api_key=settings.openai_api_key, timeout=settings.provider_timeout_seconds)
+    client = factory(
+        api_key=settings.openai_api_key,
+        timeout=settings.provider_timeout_seconds,
+        max_retries=0,
+    )
     if settings.openai_api_mode == "responses":
         response = client.responses.create(
             model=settings.active_model,
             instructions=system_prompt,
             input=messages,
-            max_output_tokens=1024,
+            max_output_tokens=settings.provider_max_output_tokens,
         )
-        return _extract_openai_responses_text(response)
+        text = _extract_openai_responses_text(response)
+        _check_openai_responses_status(response)
+        return text
 
     response = client.chat.completions.create(
         model=settings.active_model,
-        max_tokens=1024,
+        max_completion_tokens=settings.provider_max_output_tokens,
         messages=[{"role": "system", "content": system_prompt}, *messages],
     )
+    _check_openai_chat_finish(response)
     return _extract_openai_chat_text(response)
 
 
@@ -155,7 +176,10 @@ def _call_google(
             from google import genai
         except ImportError as exc:
             raise RuntimeError("Install google-genai to use ACTIVE_LLM=google.") from exc
-        client = genai.Client(api_key=settings.google_api_key)
+        client = genai.Client(
+            api_key=settings.google_api_key,
+            http_options={"timeout": settings.provider_timeout_seconds * 1000},
+        )
     contents = [
         {
             "role": "model" if message["role"] == "assistant" else "user",
@@ -168,7 +192,7 @@ def _call_google(
         contents=contents,
         config={"system_instruction": system_prompt},
     )
-    return response.text or ""
+    return _extract_google_text(response, settings)
 
 
 def _extract_openai_responses_text(response: Any) -> str:
@@ -194,3 +218,60 @@ def _extract_openai_chat_text(response: Any) -> str:
     if isinstance(response, dict):
         return response["choices"][0]["message"].get("content") or ""
     return response.choices[0].message.content or ""
+
+
+def _openai_chat_finish_reason(response: Any) -> str | None:
+    if isinstance(response, dict):
+        choices = response.get("choices") or []
+        return choices[0].get("finish_reason") if choices else None
+    choices = getattr(response, "choices", None) or []
+    return getattr(choices[0], "finish_reason", None) if choices else None
+
+
+def _check_openai_chat_finish(response: Any) -> None:
+    finish = _openai_chat_finish_reason(response)
+    if finish == "content_filter":
+        raise RuntimeError("openai blocked the response (finish_reason=content_filter).")
+    if finish == "length":
+        logger.warning("openai chat response truncated (finish_reason=length).")
+
+
+def _check_openai_responses_status(response: Any) -> None:
+    status = response.get("status") if isinstance(response, dict) else getattr(response, "status", None)
+    if status != "incomplete":
+        return
+    details = (
+        response.get("incomplete_details")
+        if isinstance(response, dict)
+        else getattr(response, "incomplete_details", None)
+    )
+    reason = None
+    if isinstance(details, dict):
+        reason = details.get("reason")
+    elif details is not None:
+        reason = getattr(details, "reason", None)
+    if reason == "content_filter":
+        raise RuntimeError("openai blocked the response (incomplete_details.reason=content_filter).")
+    logger.warning("openai response incomplete (reason=%s).", reason or "unknown")
+
+
+def _extract_google_text(response: Any, settings: Settings) -> str:
+    feedback = getattr(response, "prompt_feedback", None)
+    block_reason = getattr(feedback, "block_reason", None) if feedback is not None else None
+    if block_reason:
+        raise RuntimeError(f"google blocked the prompt (block_reason={block_reason}).")
+
+    candidates = getattr(response, "candidates", None) or []
+    finish_reason = getattr(candidates[0], "finish_reason", None) if candidates else None
+    finish_name = getattr(finish_reason, "name", None) or (str(finish_reason) if finish_reason is not None else None)
+    if finish_name in {"SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT"}:
+        raise RuntimeError(f"google blocked the response (finish_reason={finish_name}).")
+
+    try:
+        text = response.text or ""
+    except Exception as exc:  # google-genai raises on blocked/non-text responses
+        raise RuntimeError(f"google returned no usable text: {exc}") from exc
+
+    if finish_name == "MAX_TOKENS":
+        logger.warning("google response truncated (finish_reason=MAX_TOKENS).")
+    return text

@@ -1,13 +1,15 @@
-anthropic>=0.50.0
-openai>=1.70.0
-google-genai>=1.0.0
+# Runtime dependencies. Upper bounds allow the current working majors while guarding
+# against the next breaking major. Test-only deps live in requirements-dev.txt.
+anthropic>=0.50,<1
+openai>=1.70,<3
+google-genai>=1.0,<3
+# deepgram-sdk 8.0 is a breaking regeneration; this project uses the 7.x listen.v1.media API.
 deepgram-sdk>=7.1.0,<8.0.0
-elevenlabs>=1.16.0
-requests>=2.31.0
-sounddevice>=0.4.7
-soundfile>=0.12.1
-python-dotenv>=1.0.0
-numpy>=1.26.0
-rich>=13.0.0
+elevenlabs>=1.16,<3
+requests>=2.31,<3
+sounddevice>=0.4.7,<1
+soundfile>=0.12.1,<1
+python-dotenv>=1.0,<2
+numpy>=1.26,<3
+# websockets 16 changes the asyncio client API shape used by the realtime path.
 websockets>=14.0,<16.0
-pytest>=8.0.0

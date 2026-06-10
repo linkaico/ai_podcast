@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
+import integrations.openclaw_tools as openclaw_tools
+from config.settings import Settings
 from integrations.openclaw_tools import (
     episode_artifacts,
     export_transcript,
     latest_session,
     list_sessions,
     load_session,
+    run_episode,
     write_episode_context,
 )
 from pipeline.memory import ConversationMemory
@@ -83,3 +88,54 @@ def test_export_transcript_writes_markdown(tmp_path):
     assert result["turns"] == 2
     assert "**Florian:** Hello" in text
     assert "**AI:** Hi Florian" in text
+
+
+def test_run_episode_is_drivable_with_injected_io(tmp_path, monkeypatch):
+    prompts_dir = tmp_path / "config" / "prompts"
+    prompts_dir.mkdir(parents=True)
+    (prompts_dir / "base_system.txt").write_text("Base persona", encoding="utf-8")
+    settings = Settings(root_dir=tmp_path, active_llm="dry-run", active_model="dry-run-v1")
+    monkeypatch.setattr(openclaw_tools, "load_settings", lambda: settings)
+
+    inputs = iter(["hello there", "q"])
+    outputs: list[str] = []
+    result = run_episode("pilot", input_fn=lambda _prompt: next(inputs), output_fn=outputs.append)
+
+    assert result["episode"] == "pilot"
+    assert result["turns"] == 2  # user + assistant
+    assert any("Episode ended" in line for line in outputs)
+
+
+def test_load_session_rejects_out_of_tree_absolute_path(tmp_path):
+    (tmp_path / "sessions").mkdir()
+    outside = tmp_path / "outside.json"
+    outside.write_text(json.dumps({"episode": "x", "history": []}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="escapes"):
+        load_session(outside, root_dir=tmp_path)
+
+
+def test_load_session_rejects_directory_traversal(tmp_path):
+    (tmp_path / "sessions").mkdir()
+
+    with pytest.raises(ValueError, match="escapes"):
+        load_session("../secret.txt", root_dir=tmp_path)
+
+
+def test_export_transcript_rejects_out_of_tree_path(tmp_path):
+    (tmp_path / "sessions").mkdir()
+    outside = tmp_path / "outside.json"
+    outside.write_text(json.dumps({"episode": "x", "history": []}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="escapes"):
+        export_transcript(outside, root_dir=tmp_path)
+
+
+def test_write_episode_context_rejects_empty_content(tmp_path):
+    with pytest.raises(ValueError, match="must not be empty"):
+        write_episode_context("pilot", "   ", root_dir=tmp_path)
+
+
+def test_export_transcript_rejects_unknown_format(tmp_path):
+    with pytest.raises(ValueError, match="markdown"):
+        export_transcript("whatever.json", format="srt", root_dir=tmp_path)
